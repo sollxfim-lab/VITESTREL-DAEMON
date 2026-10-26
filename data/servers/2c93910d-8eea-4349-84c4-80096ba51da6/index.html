@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lantern Status</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin:0; font: 14px/1.5 "IBM Plex Sans", ui-sans-serif, system-ui; background:#0f1419; color:#e7ecf1; }
+    main { max-width: 720px; margin: 10vh auto; padding: 0 24px; }
+    h1 { font-size: 22px; font-weight: 600; letter-spacing: -0.02em; margin: 0 0 8px; }
+    p { color:#9aa5b1; margin: 0 0 24px; }
+    .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .card { background:#151b22; border:1px solid #2c3440; border-radius:4px; padding:14px 16px; }
+    .k { font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:#6d7885; }
+    .v { margin-top:6px; font-family: ui-monospace, monospace; color:#e7ecf1; }
+    .ok { color:#3fb950; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Lantern</h1>
+    <p>Static origin served by Kestrel. Replace this file from the file manager.</p>
+    <div class="grid">
+      <div class="card"><div class="k">Status</div><div class="v ok">operational</div></div>
+      <div class="card"><div class="k">Runtime</div><div class="v">python http.server</div></div>
+      <div class="card"><div class="k">Region</div><div class="v">node-01</div></div>
+      <div class="card"><div class="k">Panel</div><div class="v">kestrel 1.4.2</div></div>
+    </div>
+  </main>
+</body>
+</html>

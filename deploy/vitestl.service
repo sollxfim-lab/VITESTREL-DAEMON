@@ -1,0 +1,33 @@
+[Unit]
+Description=VITESTERTL control plane
+Documentation=https://github.com/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vitestl
+Group=vitestl
+WorkingDirectory=@APP_DIR@/backend
+EnvironmentFile=-/etc/vitestl.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=@APP_DIR@/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips=127.0.0.1
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+KillMode=mixed
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=@DATA_DIR@
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+
+# Docker-backed eggs:
+#   deploy/install.sh --with-docker creates a drop-in that adds
+#   SupplementaryGroups=docker to this unit.
+
+[Install]
+WantedBy=multi-user.target

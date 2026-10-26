@@ -1,0 +1,765 @@
+# =============================================================================
+#  Secure RDP over Tailscale
+#  Runner Windows hosted GitHub + Tailscale = RDP privat via tailnet (tanpa
+#  membuka port 3389 ke internet publik).
+#
+#  ALUR
+#    1/8  Enable Remote Desktop (NLA off, hanya untuk runner ephemeral)
+#    2/8  Provision user lokal (default: Yanxzyx) + ke Administrators & RDP Users
+#    3/8  Install Tailscale (winget, fallback MSI)
+#    4/8  Authenticate ke tailnet & tunggu IP 100.x teralokasi
+#    5/8  Firewall: izinkan TCP 3389 HANYA dari 100.64.0.0/10 + adapter Tailscale
+#    6/8  Tampilkan kredensial (password + IP) di log & job summary
+#    7/8  Opsional: deploy payload URL + auto-run saat login (kalau diisi)
+#    8/8  Keepalive + health-check port 3389 sampai job timeout
+#    9/9  Cleanup: firewall, scheduled task, logout Tailscale
+#
+#  SECRETS (Settings > Secrets and variables > Actions > New repository secret)
+#    - TAILSCALE_AUTHKEY  WAJIB. Authkey dari Tailscale admin console:
+#                          Tailscale admin > Settings > Keys > Generate auth key
+#                          PrefixWAJIB "tskey-". Disarankan: reusable +
+#                          ephemeral + tag yang diizinkan untuk device baru.
+#                          Lihat https://tailscale.com/kb/1099/auth-keys
+#    - RDP_PASSWORD      OPSIONAL. Kalau kosong, workflow memakai fallback
+#                          bawaan (lihat env.RDP_PASSWORD di bawah).
+#
+#  INPUT (workflow_dispatch)
+#    - authkey           authkey Tailscale alternatif (opsional). Dipakai hanya
+#                        bila secret TAILSCALE_AUTHKEY kosong. Nilainya dimask
+#                        di log, TAPI metadata run tetap bisa dilihat admin
+#                        repo -> secret tetap lebih aman.
+#    - rdp_user         username lokal untuk RDP            (default: Yanxzyx)
+#    - show_password    tampilkan password di log & summary (default: true)
+#    - hostname_prefix  prefix node Tailscale              (default: rdp)
+#    - max_minutes      durasi sesi, dipakai 5-345         (default: 330)
+#    - payload_url      URL script opsional, kosongkan = skip
+#
+#  CATATAN KEAMANAN
+#    - NLA dimatikan agar login password-only bisa dipakai. Konsekuensinya
+#      sesi RDP tidak memakai TLS RDP; runner ini ephemeral dan hanya
+#      terekspos lewat jaringan Tailscale.
+#    - Kredensial yang berasal dari GitHub Secret otomatis ditutup GitHub
+#      dengan "***" pada log maupun job summary.
+#    - Runner Windows hosted GitHub menegakkan policy password untuk akun
+#      lokal: panjang minimum + minimal 3 dari 4 kelas karakter. Password
+#      yang tidak memenuhi policy diperkuat OTOMATIS - string yang kamu pilih
+#      tetap jadi dasar, lalu ditambahkan karakter acak. Password yang
+#      benar-benar aktif selalu ditampilkan di step 6/8.
+# =============================================================================
+
+name: Secure RDP over Tailscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      authkey:
+        description: "Authkey Tailscale (opsional - hanya kalau tidak ingin simpan sebagai secret; nilainya dimask di log)"
+        type: string
+        default: ""
+      rdp_user:
+        description: "Username lokal untuk sesi RDP"
+        type: string
+        default: "Yanxzyx"
+      show_password:
+        description: "Tampilkan password RDP di log dan job summary"
+        type: boolean
+        default: true
+      hostname_prefix:
+        description: "Prefix hostname node Tailscale"
+        type: string
+        default: "rdp"
+      max_minutes:
+        description: "Durasi sesi dalam menit (dipakai 5-345)"
+        type: number
+        default: 330
+      payload_url:
+        description: "URL opsional untuk skrip yang dijalankan otomatis (kosong = dilewati)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  # --- Identitas sesi -------------------------------------------------------
+  RDP_USER: ${{ inputs.rdp_user }}
+  RDP_PASSWORD: ${{ secrets.RDP_PASSWORD || 'httpshkca' }}
+  SHOW_PASSWORD: ${{ inputs.show_password && 'true' || 'false' }}
+  MAX_MINUTES: ${{ inputs.max_minutes || 330 }}
+  TAILSCALE_HOSTNAME: ${{ inputs.hostname_prefix }}-r${{ github.run_id }}
+
+  # --- Tailscale ------------------------------------------------------------
+  # Urutan prioritas: secret TAILSCALE_AUTHKEY > input authkey > nilai fallback.
+  #
+  # ###########################################################################
+  # # SEMENTARA - AUTHKEY HARDCODE. HAPUS BARIS INI SETELAH MEMBUAT SECRET.  #
+  # # Alasan: nilai ini sudah terekspos (chat/log), jadi WAJIB di-revoke dan  #
+  # # diganti key baru yang disimpan sebagai GitHub Secret.                   #
+  # #                                                                      #
+  # #   gh secret set TAILSCALE_AUTHKEY --body "<authkey-baru>"             #
+  # #                                                                      #
+  # # Tailscale admin console > Settings > Keys > revoke key ini.           #
+  # ###########################################################################
+  TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY || inputs.authkey || 'tskey-auth-kbQR8XzH1o11CNTRL-1GRopZfCSgMgieiXeU6sgMTq6fto58hA2' }}
+  TAILSCALE_CIDR: "100.64.0.0/10"
+  # Versi MSI sebagai cadangan bila winget gagal. Kosongkan untuk winget saja.
+  TAILSCALE_VERSION: "1.82.0"
+
+  # --- RDP / Firewall -------------------------------------------------------
+  RDP_PORT: 3389
+  FIREWALL_RULE: "RDP-Tailscale"
+  # true -> payload berjalan elevated (UAC token filter untuk admin lokal aktif)
+  PAYLOAD_ELEVATED: "true"
+  PAYLOAD_DIR: 'C:\ProgramData\rdp-bootstrap'
+
+jobs:
+  secure-rdp:
+    name: "RDP over Tailscale"
+    runs-on: windows-latest
+    # Batas keras job (maks 360 menit untuk hosted runner).
+    #
+    # PENTING: jangan pakai ekspresi di sini, mis.
+    #   timeout-minutes: ${{ inputs.max_minutes || 330 }}
+    # Input workflow_dispatch bertipe "number" yang dikirim dari form UI GitHub
+    # arrives sebagai STRING ("330"), sehingga field ini gagal divalidasi dengan
+    # error: Unexpected value '330'. Durasi sesi diatur lewat env MAX_MINUTES
+    # dan di-clamp di dalam step keepalive (lihat step 8/8).
+    timeout-minutes: 350
+
+    steps:
+      # -------------------------------------------------------------------------
+      - name: "1/8 - Enable Remote Desktop"
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $terminalServer = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          $rdpTcp        = Join-Path $terminalServer 'WinStations\RDP-Tcp'
+
+          # Izinkan koneksi RDP
+          Set-ItemProperty -Path $terminalServer -Name 'fDenyTSConnections' -Value 0 -Force
+          Set-ItemProperty -Path $rdpTcp -Name 'fEnable' -Value 1 -Force
+
+          # Matikan NLA + Negotiate agar autentikasi password langsung diterima
+          Set-ItemProperty -Path $rdpTcp -Name 'UserAuthentication' -Value 0 -Force
+          Set-ItemProperty -Path $rdpTcp -Name 'SecurityLayer' -Value 0 -Force
+
+          # Pastikan service Remote Desktop berjalan
+          Set-Service -Name TermService -StartupType Automatic
+          if ((Get-Service TermService).Status -eq 'Running') {
+              Restart-Service TermService -Force
+          }
+          else {
+              Start-Service TermService
+          }
+
+          $listener = Get-NetTCPConnection -LocalPort $env:RDP_PORT -State Listen -ErrorAction SilentlyContinue
+          if (-not $listener) {
+              Write-Warning "Listener port $($env:RDP_PORT) belum aktif; akan diverifikasi pada step health-check."
+          }
+          else {
+              Write-Host "Remote Desktop aktif, listening di 0.0.0.0:$($env:RDP_PORT) (PID $($listener.OwningProcess))."
+          }
+
+      # -------------------------------------------------------------------------
+      - name: "2/8 - Provision user RDP"
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $userName = $env:RDP_USER
+          $password = $env:RDP_PASSWORD
+
+          if ([string]::IsNullOrWhiteSpace($userName)) {
+              throw "Input rdp_user kosong."
+          }
+          if ([string]::IsNullOrWhiteSpace($password)) {
+              throw "Password kosong. Isi secret RDP_PASSWORD atau nilai fallback di env.RDP_PASSWORD."
+          }
+
+          # -- Policy password Windows untuk akun lokal ------------------------
+          # Runner Windows hosted GitHub MENEGAKKAN password complexity pada
+          # akun lokal: panjang minimum + minimal 3 dari 4 kelas karakter.
+          # Password sederhana seperti "httpshkca" (9 karakter, 1 kelas) akan
+          # ditolak dengan InvalidPasswordException. Daripada melemahkan policy
+          # runner, workflow ini memperkuat password secara otomatis lalu
+          # menampilkan hasil akhirnya.
+          $MIN_LENGTH   = 8
+          $REQUIRED_CLS = 3
+
+          function Test-PasswordPolicy {
+              param([Parameter(Mandatory)][string] $Password)
+
+              $classes = 0
+              if ($Password -cmatch '[a-z]')          { $classes++ }
+              if ($Password -cmatch '[A-Z]')          { $classes++ }
+              if ($Password -match    '[0-9]')        { $classes++ }
+              if ($Password -match    '[^A-Za-z0-9]') { $classes++ }
+
+              [pscustomobject]@{
+                  Length    = $Password.Length
+                  LengthOk  = ($Password.Length -ge $MIN_LENGTH)
+                  Classes   = $classes
+                  ClassesOk = ($classes -ge $REQUIRED_CLS)
+                  Ok        = (($Password.Length -ge $MIN_LENGTH) -and ($classes -ge $REQUIRED_CLS))
+              }
+          }
+
+          function Get-StrongPassword {
+              param(
+                  [Parameter(Mandatory)][string] $Base,
+                  [int] $MinLength        = 8,
+                  [int] $RequiredClasses  = 3
+              )
+
+              # Alfabet tanpa karakter ambigu supaya password mudah diketik ulang
+              $sets = [ordered]@{
+                  Lower  = 'abcdefghijkmnopqrstuvwxyz'
+                  Upper  = 'ABCDEFGHJKLMNPQRSTUVWXYZ'
+                  Digit  = '23456789'
+                  Symbol = '!@#$%^&*-_=+'
+              }
+
+              $core = $Base.Trim()
+              if ($core.Length -gt 100) { $core = $core.Substring(0, 100) }
+
+              $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+              $randomChar = {
+                  param([string] $Alphabet)
+                  $bytes = New-Object byte[] 1
+                  $rng.GetBytes($bytes)
+                  $Alphabet[$bytes[0] % $Alphabet.Length]
+              }
+
+              # 1) Penuhi panjang minimum
+              while ($core.Length -lt $MinLength) {
+                  $core += & $randomChar $sets.Lower
+              }
+
+              # 2) Penuhi jumlah kelas karakter minimum
+              $classes = 0
+              if ($core -cmatch '[a-z]')          { $classes++ }
+              if ($core -cmatch '[A-Z]')          { $classes++ }
+              if ($core -match    '[0-9]')        { $classes++ }
+              if ($core -match    '[^A-Za-z0-9]') { $classes++ }
+
+              if ($classes -lt $RequiredClasses) {
+                  if ($core -cnotmatch '[A-Z]')        { $core += & $randomChar $sets.Upper  }
+                  if ($core -notmatch  '[0-9]')        { $core += & $randomChar $sets.Digit  }
+                  if ($core -notmatch  '[^A-Za-z0-9]') { $core += & $randomChar $sets.Symbol }
+                  if ($core -cnotmatch '[a-z]')        { $core += & $randomChar $sets.Lower  }
+              }
+
+              $core
+          }
+
+          # -- Tentukan password akhir ------------------------------------------
+          $finalPassword  = $password
+          $wasStrengthened = $false
+
+          $policy = Test-PasswordPolicy -Password $finalPassword
+          if (-not $policy.Ok) {
+              Write-Warning ("Password awal tidak memenuhi policy password Windows " +
+                             "(panjang $($policy.Length)/$MIN_LENGTH, kelas karakter $($policy.Classes)/$REQUIRED_CLS). " +
+                             "Workflow memperkuatnya secara otomatis.")
+              $finalPassword  = Get-StrongPassword -Base $finalPassword
+              $wasStrengthened = $true
+          }
+
+          # GITHUB_ENV tidak mendukung nilai environment yang berisi baris baru
+          if ($finalPassword -match '[\r\n]') {
+              Write-Warning "Password mengandung baris baru -> dibersihkan sebelum disimpan."
+              $finalPassword = ($finalPassword -replace '[\r\n]', '')
+              if (-not (Test-PasswordPolicy -Password $finalPassword).Ok) {
+                  $finalPassword = Get-StrongPassword -Base $finalPassword
+              }
+          }
+
+          # Simpan hasil akhir untuk ditampilkan di step 6/8
+          "RDP_PASSWORD_FINAL=$finalPassword"                       >> $env:GITHUB_ENV
+          "RDP_PASSWORD_STRENGTHENED=$($wasStrengthened.ToString().ToLower())" >> $env:GITHUB_ENV
+
+          # -- Buat atau sinkronkan user ---------------------------------------
+          $securePassword = ConvertTo-SecureString $finalPassword -AsPlainText -Force
+          if (Get-LocalUser -Name $userName -ErrorAction SilentlyContinue) {
+              Set-LocalUser -Name $userName -Password $securePassword `
+                            -AccountNeverExpires -PasswordNeverExpires
+              Write-Host "User '$userName' sudah ada -> password disinkronkan."
+          }
+          else {
+              New-LocalUser -Name $userName `
+                            -Password $securePassword `
+                            -AccountNeverExpires `
+                            -PasswordNeverExpires `
+                            -UserMayNotChangePassword `
+                            -Description 'Ephemeral RDP user (GitHub Actions + Tailscale)' | Out-Null
+              Write-Host "User '$userName' dibuat."
+          }
+
+          # -- Sanity check -----------------------------------------------------
+          $verify = Test-PasswordPolicy -Password $finalPassword
+          if (-not $verify.Ok) {
+              throw "Password hasil strengthening masih gagal policy Windows (panjang $($verify.Length), kelas $($verify.Classes))."
+          }
+          Write-Host "Policy password terpenuhi: panjang=$($verify.Length), kelas karakter=$($verify.Classes)."
+
+          # Group dicari via SID -> tidak bergantung pada bahasa Windows
+          $requiredGroups = @(
+              @{ Sid = 'S-1-5-32-544'; Fallback = 'Administrators' }
+              @{ Sid = 'S-1-5-32-555'; Fallback = 'Remote Desktop Users' }
+          )
+          foreach ($entry in $requiredGroups) {
+              $group = Get-LocalGroup -SID $entry.Sid -ErrorAction SilentlyContinue
+              if (-not $group) { $group = Get-LocalGroup -Name $entry.Fallback -ErrorAction SilentlyContinue }
+              if (-not $group) {
+                  Write-Warning "Group $($entry.Fallback) tidak ditemukan, dilewati."
+                  continue
+              }
+
+              $isMember = Get-LocalGroupMember -Group $group -ErrorAction SilentlyContinue |
+                          Where-Object { $_.Name -like "*\$userName" }
+              if ($isMember) {
+                  Write-Host "Sudah menjadi member $($group.Name) - skip."
+              }
+              else {
+                  Add-LocalGroupMember -Group $group.Name -Member $userName
+                  Write-Host "Ditambahkan ke $($group.Name)."
+              }
+          }
+
+          if ($env:PAYLOAD_ELEVATED -eq 'true') {
+              # Token admin tidak difilter pada sesi remote -> payload bisa elevate
+              Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' `
+                                 -Name 'LocalAccountTokenFilterPolicy' -Value 1 -Force
+          }
+
+          if (-not (Get-LocalUser -Name $userName)) {
+              throw "Verifikasi user '$userName' gagal."
+          }
+
+      # -------------------------------------------------------------------------
+      - name: "3/8 - Install Tailscale"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference    = 'SilentlyContinue'
+          # winget/msiexec bisa exit non-zero tanpa kegagalan fatal
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+
+          if (-not (Test-Path $tsExe)) {
+              Write-Host "Mencoba instalasi Tailscale via winget..."
+              winget install --id Tailscale.Tailscale -e --silent `
+                    --accept-source-agreements --accept-package-agreements `
+                    --disable-interactivity 2>&1 | Out-Host
+          }
+
+          if (-not (Test-Path $tsExe)) {
+              if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_VERSION)) {
+                  throw "Instalasi via winget gagal dan TAILSCALE_VERSION kosong - tidak ada metode cadangan."
+              }
+              $url = "https://pkgs.tailscale.com/stable/tailscale-setup-$($env:TAILSCALE_VERSION)-amd64.msi"
+              $msi = Join-Path $env:TEMP 'tailscale-setup.msi'
+              Write-Host "Fallback ke MSI: $url"
+              Invoke-WebRequest -Uri $url -OutFile $msi
+              $proc = Start-Process msiexec.exe `
+                        -ArgumentList @('/i', "`"$msi`"", '/qn', '/norestart') `
+                        -Wait -PassThru
+              Remove-Item $msi -Force -ErrorAction SilentlyContinue
+              if ($proc.ExitCode -notin 0, 3010) {
+                  throw "Instalasi MSI gagal, exit code $($proc.ExitCode)."
+              }
+          }
+
+          if (-not (Test-Path $tsExe)) {
+              throw "Tailscale tidak terpasang: $tsExe tidak ditemukan."
+          }
+
+          "TS_EXE=$tsExe" >> $env:GITHUB_ENV
+          Write-Host "Tailscale: $(& $tsExe version)"
+
+      # -------------------------------------------------------------------------
+      - name: "4/8 - Authenticate Tailscale & join tailnet"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          $tsExe   = $env:TS_EXE
+          $authKey = ([string]$env:TAILSCALE_AUTHKEY).Trim()
+
+          # -- Preflight: authkey wajib ada -----------------------------------
+          if ([string]::IsNullOrWhiteSpace($authKey)) {
+              Write-Host @"
+          ============================================================
+           TAILSCALE_AUTHKEY tidak ditemukan - job dihentikan
+          ============================================================
+           Repo        : $($env:GITHUB_REPOSITORY)
+           Workflow    : $($env:GITHUB_WORKFLOW)
+           Run ID      : $($env:GITHUB_RUN_ID)
+           Event       : $($env:GITHUB_EVENT_NAME)
+
+           Cek satu per satu:
+            1. Secret ada di repo yang BENAR:
+               https://github.com/$($env:GITHUB_REPOSITORY)/settings/secrets/actions
+            2. Namanya PERSIS: TAILSCALE_AUTHKEY (kapital, tanpa spasi)
+            3. Kalau secret dibuat di ENVIRONMENT
+               (Settings > Environments), job wajib punya:
+               environment: <nama-environment>
+            4. Secret milik organisasi harus bisa diakses repo ini
+               (Settings > Actions > General > Workflow permissions)
+            5. Workflow yang dijalankan dari FORK tidak bisa membaca
+               secret milik repository asal
+            6. Authkey Tailscale dibuat di:
+               Tailscale admin > Settings > Keys > Generate auth key
+               (prefix wajib tskey-)
+            7. Alternatif tanpa secret: isi input 'authkey' saat
+               menjalankan workflow (nilainya dimask di log)
+
+           Tabel environment step ini: TAILSCALE_AUTHKEY = <kosong>
+          ============================================================
+          "@
+              throw "TAILSCALE_AUTHKEY kosong. Ikuti checklist di log untuk menambahkan secret."
+          }
+
+          # Masking eksplisit: menutup authkey di log walau bermula dari input
+          Write-Output "::add-mask::$authKey"
+          Write-Host ("Authkey terdeteksi (panjang {0} karakter, prefix '{1}')." -f `
+                      $authKey.Length, $authKey.Substring(0, [Math]::Min(10, $authKey.Length)))
+
+          if ($authKey -notlike 'tskey-*') {
+              Write-Warning "Format authkey tidak diawali 'tskey-'. Pastikan key benar-benar dari Tailscale admin console."
+          }
+
+          # Sanitize hostname: Tailscale hanya menerima label DNS sederhana
+          $hostname = ($env:TAILSCALE_HOSTNAME -replace '[^A-Za-z0-9-]', '-').ToLower()
+          if ($hostname.Length -gt 63) { $hostname = $hostname.Substring(0, 63) }
+          $hostname = $hostname.Trim('-')
+          "TAILSCALE_HOST=$hostname" >> $env:GITHUB_ENV
+
+          Write-Host "Authenticate ke tailnet sebagai node '$hostname'..."
+          $upOutput = & $tsExe up `
+                          --authkey="$authKey" `
+                          --hostname="$hostname" `
+                          --accept-dns=false 2>&1 | Out-String
+          Write-Host $upOutput
+
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "--- tailscale status ---"
+              & $tsExe status 2>&1 | Out-Host
+              throw ("tailscale up gagal (exit $LASTEXITCODE). " +
+                     "Penyebab umum: authkey kedaluwarsa/sudah terpakai, tag tidak diizinkan, " +
+                     "atau key dibuat untuk tailnet lain. " +
+                     "Detail: $upOutput")
+          }
+
+          # Tunggu backend Running DAN IP 100.x teralokasi (maks 3 menit)
+          $deadline = (Get-Date).AddMinutes(3)
+          $tsIp     = $null
+          while ((Get-Date) -lt $deadline) {
+              $state = $null
+              try {
+                  $raw = (& $tsExe status --json 2>$null | Out-String)
+                  if ($raw) { $state = ($raw | ConvertFrom-Json).BackendState }
+              }
+              catch {
+                  Write-Host "Gagal membaca status (retry): $($_.Exception.Message)"
+              }
+
+              if ($state -eq 'Running') {
+                  $tsIp = (& $tsExe ip -4 2>$null | Out-String).Trim()
+                  if ($tsIp) { break }
+              }
+
+              Write-Host "BackendState=$state -> menunggu IP Tailscale..."
+              Start-Sleep -Seconds 5
+          }
+
+          if (-not $tsIp) {
+              & $tsExe status 2>&1 | Out-Host
+              throw "IP Tailscale tidak teralokasi dalam 3 menit."
+          }
+
+          "TAILSCALE_IP=$tsIp" >> $env:GITHUB_ENV
+          Write-Host "Terautentikasi. Node '$hostname' -> $tsIp"
+
+      # -------------------------------------------------------------------------
+      - name: "5/8 - Firewall rule (Tailscale only)"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ruleName = $env:FIREWALL_RULE
+
+          # Idempoten: buang rule lama bila ada
+          Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue |
+              Remove-NetFirewallRule -ErrorAction SilentlyContinue
+
+          $params = @{
+              DisplayName   = $ruleName
+              Direction     = 'Inbound'
+              Action        = 'Allow'
+              Protocol      = 'TCP'
+              LocalPort     = $env:RDP_PORT
+              RemoteAddress = $env:TAILSCALE_CIDR
+              Profile       = 'Any'
+              Description   = 'RDP hanya boleh diakses dari jaringan Tailscale'
+          }
+
+          $adapter = Get-NetAdapter |
+                     Where-Object { $_.Name -match 'Tailscale' -or $_.InterfaceDescription -match 'Tailscale' } |
+                     Select-Object -First 1
+          if ($adapter) {
+              $params['InterfaceAlias'] = $adapter.Name
+              Write-Host "Rule diikat ke interface '$($adapter.Name)'."
+          }
+          else {
+              Write-Warning "Adapter Tailscale tidak terdeteksi; rule hanya dibatasi $($env:TAILSCALE_CIDR)."
+          }
+
+          New-NetFirewallRule @params | Out-Null
+          Get-NetFirewallRule -DisplayName $ruleName |
+              Get-NetFirewallPortFilter |
+              Format-Table Protocol, LocalPort -AutoSize | Out-Host
+
+      # -------------------------------------------------------------------------
+      - name: "6/8 - Verifikasi RDP & tampilkan kredensial"
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $tsIp = $env:TAILSCALE_IP
+          $port = $env:RDP_PORT
+
+          # Health-check dengan retry (listener RDP kadang butuh beberapa detik)
+          $deadline = (Get-Date).AddMinutes(3)
+          $ok       = $false
+          $probe    = $null
+          while ((Get-Date) -lt $deadline) {
+              $probe = Test-NetConnection -ComputerName $tsIp -Port $port -WarningAction SilentlyContinue
+              if ($probe.TcpTestSucceeded) { $ok = $true; break }
+              Write-Host "Port $port belum terbuka via $tsIp, retry..."
+              Start-Sleep -Seconds 10
+          }
+
+          if (-not $ok) {
+              $probe | Format-List | Out-Host
+              throw "Health-check TCP ${tsIp}:${port} gagal."
+          }
+
+          # --- Durasi sesi (validasi + clamp) ---------------------------------
+          # Input number dari form UI GitLab datang sebagai STRING, jadi
+          # divalidasi di sini. Batas atas 345 menit memberi margin 5 menit
+          # terhadap timeout-minutes 350 supaya shutdown selalu rapi.
+          $minutes = 330
+          $rawMinutes = ([string]$env:MAX_MINUTES).Trim()
+          if ($rawMinutes -match '^\d+(\.\d+)?$') {
+              $minutes = [int][double]::Parse($rawMinutes, [Globalization.CultureInfo]::InvariantCulture)
+          }
+          $minutes = [Math]::Min([Math]::Max($minutes, 5), 345)
+          "SESSION_MINUTES=$minutes" >> $env:GITHUB_ENV
+          $sessionEnd = (Get-Date).AddMinutes($minutes).ToString('yyyy-MM-dd HH:mm:ss')
+          Write-Host "Durasi sesi: $minutes menit (sampai $sessionEnd)."
+
+          # --- Kredensial untuk ditampilkan ------------------------------------
+          # Tampilkan password FINAL (hasil strengthening dari step 2/8),
+          # bukan nilai input, supaya yang ditampilkan benar-benar bisa dipakai.
+          $activePassword = if ($env:RDP_PASSWORD_FINAL) {
+              $env:RDP_PASSWORD_FINAL
+          }
+          else {
+              $env:RDP_PASSWORD
+          }
+
+          $passwordText = if ($env:SHOW_PASSWORD -ne 'true') {
+              '(disembunyikan - set show_password=true untuk melihatnya)'
+          }
+          else {
+              $activePassword
+          }
+
+          $strengthenedNote = if ($env:RDP_PASSWORD_STRENGTHENED -eq 'true') {
+              "`n| Catatan | Password diperkuat otomatis agar memenuhi policy Windows " +
+              "(input: ``$($env:RDP_PASSWORD)``) |"
+          }
+          else {
+              ''
+          }
+
+          Write-Host ""
+          Write-Host "===================== RDP READY ====================="
+          Write-Host ("  Address   : {0}" -f $tsIp)
+          Write-Host ("  Hostname  : {0}" -f $env:TAILSCALE_HOST)
+          Write-Host ("  Port      : {0}" -f $port)
+          Write-Host ("  Username  : {0}" -f $env:RDP_USER)
+          Write-Host ("  Password  : {0}" -f $passwordText)
+          Write-Host ("  Berlaku   : {0} menit (sampai {1})" -f $minutes, $sessionEnd)
+          Write-Host "====================================================="
+          if ($env:RDP_PASSWORD_STRENGTHENED -eq 'true') {
+              Write-Host "  Catatan   : password diperkuat otomatis oleh policy Windows."
+              Write-Host "              Yang aktif adalah password di atas, bukan input awal."
+          }
+          Write-Host ""
+
+          $passwordCell = if ($env:SHOW_PASSWORD -ne 'true') { '_disembunyikan_' } else { "``$passwordText``" }
+
+          $summary = @"
+          ## RDP Session Ready
+
+          | Field | Value |
+          | --- | --- |
+          | Address | ``$tsIp`` |
+          | Hostname | ``$($env:TAILSCALE_HOST)`` |
+          | Port | ``$port`` |
+          | Username | ``$($env:RDP_USER)`` |
+          | Password | $passwordCell |
+          | Firewall | ``$($env:FIREWALL_RULE)`` (hanya ``$($env:TAILSCALE_CIDR)``) |
+          | Masa aktif | ``$minutes`` menit (sampai ``$sessionEnd``) |$strengthenedNote
+
+          ### Cara konek dari PC klien
+
+          1. Install Tailscale di PC klien, lalu login dengan akun yang sama.
+          2. Buka **Remote Desktop Connection** (`mstsc`) -> masukkan Address di atas.
+          3. Masukkan username + password di atas.
+          4. Pesan sertifikat/self-signed certificate: pilih **Yes** untuk lanjut.
+
+          Job berhenti otomatis pada batas waktu di atas, dan step cleanup tetap
+          dijalankan (firewall dihapus, Tailscale logout). Hentikan lebih awal
+          dengan **Cancel workflow**.
+          "@
+
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      # -------------------------------------------------------------------------
+      - name: "7/8 - Deploy payload (opsional)"
+        if: env.PAYLOAD_URL != ''
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference    = 'SilentlyContinue'
+
+          $payloadDir  = $env:PAYLOAD_DIR
+          $payloadPath = Join-Path $payloadDir 'run-payload.bat'
+          $runLevel    = if ($env:PAYLOAD_ELEVATED -eq 'true') { 'Highest' } else { 'Limited' }
+
+          New-Item -ItemType Directory -Path $payloadDir -Force | Out-Null
+          Invoke-WebRequest -Uri $env:PAYLOAD_URL -OutFile $payloadPath -MaximumRedirection 5
+
+          $payload = Get-Item $payloadPath
+          if ($payload.Length -eq 0) {
+              Remove-Item $payloadPath -Force
+              throw "Payload terunduh tapi kosong - periksa payload_url."
+          }
+
+          # Host privat tanpa auth akan mengembalikan halaman login HTML, bukan file.
+          $head = (Get-Content -LiteralPath $payloadPath -TotalCount 5 -ErrorAction SilentlyContinue) -join "`n"
+          if ($head -match '(?i)<!doctype\s+html|<html|users/sign_in|<title>') {
+              Remove-Item $payloadPath -Force
+              throw "Isi payload adalah HTML, bukan script. Penyebab umum: repository privat. Pakai URL publik atau endpoint ber-token."
+          }
+
+          $hash = (Get-FileHash $payloadPath -Algorithm SHA256).Hash
+          Write-Host "Payload : $($payload.FullName) ($($payload.Length) bytes)"
+          Write-Host "SHA256  : $hash"
+          "PAYLOAD_SHA256=$hash"     >> $env:GITHUB_ENV
+          "PAYLOAD_PATH=$payloadPath" >> $env:GITHUB_ENV
+
+          # Auto-run saat user RDP login. Scheduled Task lebih andal daripada
+          # folder Startup, karena folder Startup baru ada setelah profile user
+          # terbentuk (yaitu setelah login pertama).
+          $taskName = 'RDP-Bootstrap'
+          Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue |
+              Unregister-ScheduledTask -Confirm:$false
+
+          $action    = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument "/c `"$payloadPath`""
+          $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $env:RDP_USER
+          $principal = New-ScheduledTaskPrincipal -UserId $env:RDP_USER -LogonType Interactive -RunLevel $runLevel
+          $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
+                                                    -DontStopIfGoingOnBatteries `
+                                                    -MultipleInstances IgnoreNew `
+                                                    -ExecutionTimeLimit (New-TimeSpan -Hours 6)
+          Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+                                 -Principal $principal -Settings $settings `
+                                 -Description "Auto-run payload saat $($env:RDP_USER) login via RDP" -Force | Out-Null
+          Write-Host "Scheduled task '$taskName' terdaftar (RunLevel=$runLevel)."
+
+          # Jalankan sekali sekarang agar tidak menunggu user login
+          Start-Process -FilePath 'cmd.exe' `
+                        -ArgumentList @('/c', "`"$payloadPath`"") `
+                        -WindowStyle Hidden
+          Write-Host "Payload dijalankan di background."
+
+      # -------------------------------------------------------------------------
+      - name: "8/8 - Keepalive & health-check"
+        id: keepalive
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          # Durasi sesi sudah divalidasi + di-clamp di step 6/8 (SESSION_MINUTES).
+          # Fallback di sini menjaga step tetap aman kalau step 6 dilewati.
+          $minutes = 330
+          if ($env:SESSION_MINUTES -match '^\d+$') { $minutes = [int]$env:SESSION_MINUTES }
+          else {
+              $rawMinutes = ([string]$env:MAX_MINUTES).Trim()
+              if ($rawMinutes -match '^\d+(\.\d+)?$') {
+                  $minutes = [int][double]::Parse($rawMinutes, [Globalization.CultureInfo]::InvariantCulture)
+              }
+          }
+          $minutes = [Math]::Min([Math]::Max($minutes, 5), 345)
+          $deadline = (Get-Date).AddMinutes($minutes)
+          Write-Host "Sesi aktif sampai $($deadline.ToString('yyyy-MM-dd HH:mm:ss')) - $minutes menit."
+
+          $lastCheck = Get-Date
+          while ($true) {
+              $probe  = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port $env:RDP_PORT -WarningAction SilentlyContinue
+              $status = if ($probe.TcpTestSucceeded) { 'UP' } else { 'DOWN' }
+              Write-Host ("[{0}] RDP={1} {2}:{3} user={4} node={5}" -f `
+                          (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $status,
+                          $env:TAILSCALE_IP, $env:RDP_PORT, $env:RDP_USER, $env:TAILSCALE_HOST)
+
+              # Self-heal ringan bila port tidak terjangkau
+              if (((Get-Date) - $lastCheck).TotalMinutes -ge 30) {
+                  $lastCheck = Get-Date
+                  if ($status -eq 'DOWN') {
+                      Write-Host "::warning::Port tidak terjangkau, mencoba re-up Tailscale..."
+                      & $env:TS_EXE up --accept-dns=false 2>&1 | Out-Host
+                  }
+              }
+
+              # Jangan lampaui deadline, biarkan job selesai rapi
+              if ((Get-Date) -ge $deadline) {
+                  Write-Host "Sesi RDP sudah mencapai batas $minutes menit, menutup job dengan rapi."
+                  break
+              }
+
+              Start-Sleep -Seconds 300
+          }
+
+      # -------------------------------------------------------------------------
+      - name: "9/9 - Cleanup"
+        if: always()
+        continue-on-error: true
+        env:
+          KEEPALIVE_OUTCOME: ${{ steps.keepalive.outcome }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          Write-Host "=== Cleanup (keepalive: $env:KEEPALIVE_OUTCOME) ==="
+
+          Get-ScheduledTask -TaskName 'RDP-Bootstrap' -ErrorAction SilentlyContinue |
+              Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
+
+          Get-NetFirewallRule -DisplayName $env:FIREWALL_RULE -ErrorAction SilentlyContinue |
+              Remove-NetFirewallRule -ErrorAction SilentlyContinue
+
+          if ($env:TS_EXE -and (Test-Path $env:TS_EXE)) {
+              & $env:TS_EXE logout 2>&1 | Out-Host
+          }
+
+          Remove-Item $env:PAYLOAD_DIR -Recurse -Force -ErrorAction SilentlyContinue
+
+          "### Cleanup`n`n- Firewall rule dihapus`n- Scheduled task dihapus`n- Tailscale logout (node lepas dari tailnet)" |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
