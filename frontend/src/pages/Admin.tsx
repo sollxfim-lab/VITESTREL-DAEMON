@@ -1,14 +1,20 @@
 import { CSSProperties, FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { Link, Outlet, useNavigate, useParams } from "react-router-dom";
+import { Link, Outlet, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
   Activity,
   api,
   fmtBytes,
   fmtDate,
   timeAgo,
+  type EggCatalogEntry,
 } from "../api";
 import { Icon } from "../icons";
 import { ResourceLimits } from "../resources";
+import {
+  MinecraftSetup,
+  minecraftSetupReady,
+  type MinecraftSetupValue,
+} from "../minecraft";
 import nodeInstallArt from "../assets/node-install.svg";
 import {
   activityInfo,
@@ -44,12 +50,40 @@ function eggIcon(nest: string): string {
   if (value.includes("node")) return "node-js";
   if (value.includes("java")) return "java";
   if (value.includes("docker")) return "docker";
+  if (value.includes("minecraft")) return "cube";
+  if (value.includes("voice")) return "microphone";
+  if (value.includes("database")) return "database";
+  if (value.includes("bot")) return "robot";
+  if (value.includes("system")) return "gears";
   return "cube";
 }
 
 function eggBrand(nest: string): boolean {
   return /python|node|java|docker/i.test(nest || "");
 }
+
+function eggInstalled(egg: EggCatalogEntry | any): boolean {
+  return !!egg?.installed || Number(egg?.deployments || 0) > 0;
+}
+
+function eggDefaults(egg: EggCatalogEntry | any): { memory: number; disk: number } {
+  if (Number(egg?.id) === 27) return { memory: 2048, disk: 10240 };
+  if (Number(egg?.id) === 28) return { memory: 1024, disk: 5120 };
+  return { memory: 256, disk: 1024 };
+}
+
+function fmtMiB(value: number): string {
+  const amount = Math.max(0, Number(value || 0));
+  return amount >= 1024 ? `${(amount / 1024).toFixed(amount % 1024 ? 1 : 0)} GiB` : `${amount} MiB`;
+}
+
+type BulkInstallResult = {
+  eggId: number;
+  name: string;
+  status: "pending" | "running" | "created" | "failed";
+  message: string;
+  serverId?: string;
+};
 
 function daemonTone(daemon: string): string {
   if (daemon === "connected") return "ok";
@@ -474,7 +508,9 @@ export function AdminServers() {
 
 export function NewServer() {
   const nav = useNavigate();
-  const [step, setStep] = useState(1);
+  const [params] = useSearchParams();
+  const presetEgg = Number(params.get("egg") || 0);
+  const [step, setStep] = useState(presetEgg ? 2 : 1);
   const [eggs, setEggs] = useState<any[]>([]);
   const [nests, setNests] = useState<any[]>([]);
   const [users, setUsers] = useState<any[]>([]);
@@ -482,33 +518,71 @@ export function NewServer() {
   const [allocations, setAllocations] = useState<any[]>([]);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [eggWarning, setEggWarning] = useState("");
+  const [syncingEggs, setSyncingEggs] = useState(false);
+  const [catalogToken, setCatalogToken] = useState(0);
+  const [minecraftConfig, setMinecraftConfig] = useState<MinecraftSetupValue | null>(null);
   const [form, setForm] = useState({
     name: "",
     description: "",
-    egg_id: 2,
+    egg_id: presetEgg || 2,
     owner_id: 0,
     node_id: 0,
     allocation_id: 0,
-    memory: 512,
+    memory: presetEgg === 27 || presetEgg === 28 ? 2048 : 512,
     cpu: 100,
-    disk: 2048,
+    disk: presetEgg === 27 || presetEgg === 28 ? 10240 : 2048,
     start_on_completion: false,
     environment: {} as Record<string, string>,
   });
 
   useEffect(() => {
-    api.adminNests().then((response) => {
-      setEggs(response.eggs);
-      setNests(response.nests);
-      if (response.eggs[0]) {
-        const egg = response.eggs.find((item: any) => item.id === 2) || response.eggs[0];
-        setForm((current) => ({
-          ...current,
-          egg_id: egg.id,
-          environment: Object.fromEntries(eggVars(egg).map((variable) => [variable.env, variable.default || ""])),
-        }));
+    let alive = true;
+    async function loadCatalog() {
+      try {
+        let response = await api.adminNests();
+        if (
+          presetEgg &&
+          !response.eggs.some((item: any) => item.id === presetEgg) &&
+          response.catalog_health?.missing?.length
+        ) {
+          setSyncingEggs(true);
+          await api.adminSyncNests();
+          response = await api.adminNests();
+        }
+        if (!alive) return;
+        setEggs(response.eggs);
+        setNests(response.nests);
+        const requested = presetEgg
+          ? response.eggs.find((item: any) => item.id === presetEgg)
+          : null;
+        const egg = requested || response.eggs.find((item: any) => item.id === 2) || response.eggs[0];
+        if (presetEgg && !requested) {
+          setEggWarning(
+            `Egg ${presetEgg} is not present in this panel's catalogue. ` +
+              `Known built-in IDs: ${(response.catalog_health?.known_egg_ids || []).join(", ") || "unavailable"}. ` +
+              "Run Administration -> Nests -> Sync catalogue, then reload this page."
+          );
+        } else {
+          setEggWarning("");
+        }
+        if (egg) {
+          setForm((current) => ({
+            ...current,
+            egg_id: egg.id,
+            environment: Object.fromEntries(eggVars(egg).map((variable) => [variable.env, variable.default || ""])),
+          }));
+        } else {
+          setEggWarning("No eggs are installed. Sync the catalogue or deploy the current backend.");
+        }
+      } catch (err: any) {
+        if (!alive) return;
+        setEggWarning(err?.message || "Unable to load the egg catalogue");
+      } finally {
+        if (alive) setSyncingEggs(false);
       }
-    });
+    }
+    loadCatalog();
     api.adminUsers().then((response) => {
       setUsers(response.data);
       const owner = response.data.find((user: any) => user.role === "admin") || response.data[0];
@@ -519,7 +593,10 @@ export function NewServer() {
       const local = response.data.find((node: any) => node.daemon === "connected") || response.data[0];
       if (local) setForm((current) => ({ ...current, node_id: local.id }));
     });
-  }, []);
+    return () => {
+      alive = false;
+    };
+  }, [presetEgg, catalogToken]);
 
   useEffect(() => {
     if (!form.node_id) return;
@@ -533,19 +610,38 @@ export function NewServer() {
   const selectedNode = nodes.find((node) => node.id === form.node_id);
   const selectedOwner = users.find((user) => user.id === form.owner_id);
   const variables = eggVars(selectedEgg);
+  const isMinecraftEgg = form.egg_id === 27 || form.egg_id === 28;
+  const minecraftEdition: "java" | "bedrock" = form.egg_id === 28 ? "bedrock" : "java";
 
   function pickEgg(id: number) {
     const egg = eggs.find((item) => item.id === id);
+    const minecraft = id === 27 || id === 28;
+    setMinecraftConfig(null);
     setForm((current) => ({
       ...current,
       egg_id: id,
+      memory: minecraft ? Math.max(current.memory, 2048) : current.memory,
+      disk: minecraft ? Math.max(current.disk, 10240) : current.disk,
       environment: Object.fromEntries(eggVars(egg).map((variable) => [variable.env, variable.default || ""])),
     }));
   }
 
+  async function syncEggCatalog() {
+    setSyncingEggs(true);
+    try {
+      const result = await api.adminSyncNests();
+      notify(`Catalogue synced: ${result.nests} nests and ${result.eggs} eggs`);
+      setCatalogToken((value) => value + 1);
+    } catch (err: any) {
+      notify(err?.message || "Catalogue sync failed", "error");
+    } finally {
+      setSyncingEggs(false);
+    }
+  }
+
   const canContinue =
     (step === 1 && form.name.trim().length >= 2 && form.owner_id > 0) ||
-    (step === 2 && !!form.egg_id) ||
+    (step === 2 && !!form.egg_id && (!isMinecraftEgg || minecraftSetupReady(minecraftConfig))) ||
     (step === 3 && form.node_id > 0);
 
   async function submit(event: FormEvent) {
@@ -571,9 +667,22 @@ export function NewServer() {
         start_on_completion: form.start_on_completion,
       };
       if (form.allocation_id) payload.allocation_id = form.allocation_id;
+      if (isMinecraftEgg && minecraftConfig) {
+        payload.minecraft = {
+          software: minecraftConfig.software,
+          version: minecraftConfig.version,
+          loader_version: minecraftConfig.loader_version,
+          accept_eula: minecraftConfig.accept_eula,
+          properties: minecraftConfig.properties,
+        };
+        payload.accept_eula = minecraftConfig.accept_eula;
+      }
       const response = await api.adminCreateServer(payload);
-      notify("Server provisioned");
-      nav(`/server/${response.data.id}`);
+      notify(
+        isMinecraftEgg ? "Server created - Minecraft installation queued" : "Server provisioned",
+        isMinecraftEgg ? "info" : "success"
+      );
+      nav(`/server/${response.data.id}?tab=minecraft`);
     } catch (err: any) {
       setError(err.message || "Provisioning failed");
     } finally {
@@ -625,6 +734,16 @@ export function NewServer() {
             )}
             {step === 2 && (
               <div>
+                {eggWarning && (
+                  <div className="err egg-catalog-warning">
+                    <Icon name="circle-exclamation" />
+                    <span>{eggWarning}</span>
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={syncEggCatalog} disabled={syncingEggs}>
+                      <Icon name={syncingEggs ? "circle-notch" : "rotate"} className={syncingEggs ? "spin" : ""} />
+                      Sync catalogue
+                    </button>
+                  </div>
+                )}
                 <div className="field">
                   <label>Nest and egg</label>
                   <select value={form.egg_id} onChange={(event) => pickEgg(Number(event.target.value))}>
@@ -648,15 +767,33 @@ export function NewServer() {
                     </div>
                   </div>
                 )}
-                {variables.length > 0 && (
-                  <div className="variable-grid">
-                    {variables.map((variable) => (
-                      <div className="field" key={variable.env}>
-                        <label>{variable.name} <span className="field-env">{variable.env}</span></label>
-                        <input value={form.environment[variable.env] || ""} onChange={(event) => setForm({ ...form, environment: { ...form.environment, [variable.env]: event.target.value } })} />
-                      </div>
-                    ))}
-                  </div>
+                {isMinecraftEgg ? (
+                  <>
+                    <div className="mc-wizard-note">
+                      <Icon name="circle-info" />
+                      <span>
+                        This egg runs the panel Minecraft installer. Choose the edition with the egg selector:
+                        Minecraft Java (auto-installer) or Minecraft Bedrock (auto-installer).
+                      </span>
+                    </div>
+                    <MinecraftSetup
+                      key={`minecraft-${minecraftEdition}`}
+                      edition={minecraftEdition}
+                      initial={minecraftConfig}
+                      onChange={setMinecraftConfig}
+                    />
+                  </>
+                ) : (
+                  variables.length > 0 && (
+                    <div className="variable-grid">
+                      {variables.map((variable) => (
+                        <div className="field" key={variable.env}>
+                          <label>{variable.name} <span className="field-env">{variable.env}</span></label>
+                          <input value={form.environment[variable.env] || ""} onChange={(event) => setForm({ ...form, environment: { ...form.environment, [variable.env]: event.target.value } })} />
+                        </div>
+                      ))}
+                    </div>
+                  )
                 )}
               </div>
             )}
@@ -713,6 +850,13 @@ export function NewServer() {
             <div className="card-body identity-list">
               <div><span>Owner</span><span>{selectedOwner?.username || "Not assigned"}</span></div>
               <div><span>Egg</span><span>{selectedEgg?.name || "Not selected"}</span></div>
+              {isMinecraftEgg && (
+                <>
+                  <div><span>Minecraft software</span><span>{minecraftConfig?.software_name || "Not selected"}</span></div>
+                  <div><span>Minecraft version</span><span>{minecraftConfig?.version || "Latest"}</span></div>
+                  <div><span>Loader / build</span><span>{minecraftConfig?.loader_version || "Default"}</span></div>
+                </>
+              )}
               <div><span>Node</span><span>{selectedNode?.name || "Not selected"}</span></div>
               <div><span>Primary port</span><span>{form.allocation_id ? allocations.find((allocation) => allocation.id === form.allocation_id)?.port : "Auto"}</span></div>
               <div><span>Memory</span><span>{form.memory} MiB</span></div>
@@ -1542,14 +1686,51 @@ export function NodeDetail() {
 
 export function Nests() {
   const [nests, setNests] = useState<any[] | null>(null);
-  const [eggs, setEggs] = useState<any[]>([]);
+  const [eggs, setEggs] = useState<EggCatalogEntry[]>([]);
+  const [catalog, setCatalog] = useState({ nests: 0, eggs: 0, version: "" });
+  const [catalogHealth, setCatalogHealth] = useState<{ repaired?: boolean; missing?: number[]; known_egg_ids?: number[] } | null>(null);
   const [error, setError] = useState("");
+  const [query, setQuery] = useState("");
+  const [installFilter, setInstallFilter] = useState<"all" | "installed" | "missing">("all");
+  const [selectedEggs, setSelectedEggs] = useState<number[]>([]);
+  const [syncing, setSyncing] = useState(false);
+  const [nestOpen, setNestOpen] = useState(false);
+  const [eggOpen, setEggOpen] = useState(false);
+  const [nestForm, setNestForm] = useState({ name: "", description: "" });
+  const [eggForm, setEggForm] = useState({
+    nest_id: 0,
+    name: "",
+    description: "",
+    docker_image: "python:3.11-slim",
+    startup: "python3 main.py",
+    runtime: "process",
+  });
+  const [busy, setBusy] = useState(false);
+  const [users, setUsers] = useState<any[]>([]);
+  const [nodes, setNodes] = useState<any[]>([]);
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [bulkIds, setBulkIds] = useState<number[]>([]);
+  const [bulkOwner, setBulkOwner] = useState(0);
+  const [bulkNode, setBulkNode] = useState(0);
+  const [bulkPrefix, setBulkPrefix] = useState("");
+  const [bulkMemory, setBulkMemory] = useState(256);
+  const [bulkDisk, setBulkDisk] = useState(1024);
+  const [bulkStart, setBulkStart] = useState(false);
+  const [bulkEula, setBulkEula] = useState(false);
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [bulkResults, setBulkResults] = useState<BulkInstallResult[]>([]);
 
   const load = useCallback(async () => {
     try {
       const response = await api.adminNests();
       setNests(response.nests);
       setEggs(response.eggs);
+      setCatalog(response.catalog || { nests: response.nests.length, eggs: response.eggs.length, version: "" });
+      setCatalogHealth(response.catalog_health || null);
+      setEggForm((current) => ({
+        ...current,
+        nest_id: current.nest_id || response.nests[0]?.id || 0,
+      }));
       setError("");
     } catch (err: any) {
       setError(err.message || "Unable to load nests");
@@ -1557,6 +1738,257 @@ export function Nests() {
   }, []);
 
   useEffect(() => { load(); }, [load]);
+
+  useEffect(() => {
+    let alive = true;
+    Promise.allSettled([api.adminUsers(), api.adminNodes()]).then(([userResult, nodeResult]) => {
+      if (!alive) return;
+      if (userResult.status === "fulfilled") setUsers(userResult.value.data);
+      if (nodeResult.status === "fulfilled") setNodes(nodeResult.value.data);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    setSelectedEggs((current) => current.filter((id) => eggs.some((egg) => egg.id === id)));
+  }, [eggs]);
+
+  useEffect(() => {
+    if (!bulkOpen) return;
+    setBulkOwner((current) => current || users.find((user) => user.role === "admin")?.id || users[0]?.id || 0);
+    setBulkNode((current) => current || nodes.find((node) => node.daemon === "connected")?.id || nodes[0]?.id || 0);
+  }, [bulkOpen, users, nodes]);
+
+  const needle = query.trim().toLowerCase();
+  const installedCount = eggs.filter(eggInstalled).length;
+  const missingEggs = eggs.filter((egg) => !eggInstalled(egg));
+  const coverage = eggs.length ? Math.round((installedCount / eggs.length) * 100) : 0;
+
+  function matchesInstallFilter(egg: EggCatalogEntry): boolean {
+    if (installFilter === "installed") return eggInstalled(egg);
+    if (installFilter === "missing") return !eggInstalled(egg);
+    return true;
+  }
+
+  function matchesSearch(egg: EggCatalogEntry, nest: any): boolean {
+    if (!needle) return true;
+    return (
+      nest.name.toLowerCase().includes(needle) ||
+      (nest.description || "").toLowerCase().includes(needle) ||
+      `${egg.name} ${egg.description} ${egg.startup} ${egg.docker_image}`.toLowerCase().includes(needle)
+    );
+  }
+
+  const visibleNests = (nests || []).filter((nest) => {
+    const nestEggs = eggs.filter((egg) => egg.nest_id === nest.id);
+    const matching = nestEggs.filter((egg) => matchesInstallFilter(egg) && matchesSearch(egg, nest));
+    if (matching.length) return true;
+    if (installFilter !== "all") return false;
+    if (!needle) return true;
+    return nest.name.toLowerCase().includes(needle) || (nest.description || "").toLowerCase().includes(needle);
+  });
+
+  const bulkEggs = useMemo(
+    () => bulkIds.map((id) => eggs.find((egg) => egg.id === id)).filter(Boolean) as EggCatalogEntry[],
+    [bulkIds, eggs]
+  );
+  const bulkNodeData = nodes.find((node) => node.id === bulkNode);
+  const bulkMemLimit = bulkNodeData
+    ? Number(bulkNodeData.memory || 0) * (1 + Number(bulkNodeData.memory_overallocate || 0) / 100)
+    : 0;
+  const bulkDiskLimit = bulkNodeData
+    ? Number(bulkNodeData.disk || 0) * (1 + Number(bulkNodeData.disk_overallocate || 0) / 100)
+    : 0;
+  const bulkMemFree = Math.max(0, bulkMemLimit - Number(bulkNodeData?.memory_allocated || 0));
+  const bulkDiskFree = Math.max(0, bulkDiskLimit - Number(bulkNodeData?.disk_allocated || 0));
+  const bulkPlan = bulkEggs.reduce(
+    (total, egg) => {
+      const defaults = eggDefaults(egg);
+      const memory = Number(egg.id) === 27 || Number(egg.id) === 28 ? defaults.memory : bulkMemory;
+      const disk = Number(egg.id) === 27 || Number(egg.id) === 28 ? defaults.disk : bulkDisk;
+      return { memory: total.memory + memory, disk: total.disk + disk };
+    },
+    { memory: 0, disk: 0 }
+  );
+  const bulkIncludesMinecraft = bulkEggs.some((egg) => egg.id === 27 || egg.id === 28);
+  const bulkOverCapacity =
+    !!bulkNodeData && (bulkPlan.memory > bulkMemFree || bulkPlan.disk > bulkDiskFree);
+  const bulkStarted = bulkResults.some((result) => result.status !== "pending");
+  const bulkFinished =
+    bulkResults.length > 0 &&
+    bulkResults.every((result) => result.status === "created" || result.status === "failed");
+  const bulkCreated = bulkResults.filter((result) => result.status === "created").length;
+  const bulkFailed = bulkResults.filter((result) => result.status === "failed").length;
+
+  async function syncCatalog() {
+    setSyncing(true);
+    try {
+      const result = await api.adminSyncNests();
+      notify(`Catalogue synced: ${result.nests} nests and ${result.eggs} eggs`);
+      await load();
+    } catch (err: any) {
+      notify(err.message || "Catalogue sync failed", "error");
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  async function createNest(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    try {
+      await api.adminCreateNest(nestForm);
+      notify("Nest created");
+      setNestOpen(false);
+      setNestForm({ name: "", description: "" });
+      await load();
+    } catch (err: any) {
+      notify(err.message || "Unable to create nest", "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function createEgg(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    try {
+      await api.adminCreateEgg(eggForm);
+      notify("Egg created");
+      setEggOpen(false);
+      setEggForm((current) => ({ ...current, name: "", description: "" }));
+      await load();
+    } catch (err: any) {
+      notify(err.message || "Unable to create egg", "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function toggleEgg(id: number) {
+    setSelectedEggs((current) =>
+      current.includes(id) ? current.filter((item) => item !== id) : [...current, id]
+    );
+  }
+
+  function openBulk(ids: number[]) {
+    const unique = Array.from(new Set(ids.filter(Boolean)));
+    if (!unique.length) return;
+    const selected = unique
+      .map((id) => eggs.find((egg) => egg.id === id))
+      .filter(Boolean) as EggCatalogEntry[];
+    setBulkIds(unique);
+    setBulkResults(
+      selected.map((egg) => ({
+        eggId: egg.id,
+        name: egg.name,
+        status: "pending",
+        message: "Waiting",
+      }))
+    );
+    setBulkOwner((current) => current || users.find((user) => user.role === "admin")?.id || users[0]?.id || 0);
+    setBulkNode((current) => current || nodes.find((node) => node.daemon === "connected")?.id || nodes[0]?.id || 0);
+    setBulkEula(false);
+    setBulkOpen(true);
+  }
+
+  function closeBulk() {
+    if (bulkBusy) return;
+    setBulkOpen(false);
+  }
+
+  async function startBulk() {
+    if (!bulkEggs.length || !bulkOwner || !bulkNode) {
+      notify("Choose an owner and node before installing", "error");
+      return;
+    }
+    if (bulkIncludesMinecraft && !bulkEula) {
+      notify("Accept the Minecraft EULA before installing Minecraft eggs", "error");
+      return;
+    }
+    setBulkBusy(true);
+    let created = 0;
+    let failed = 0;
+    for (const egg of bulkEggs) {
+      const defaults = eggDefaults(egg);
+      const minecraft = egg.id === 27 || egg.id === 28;
+      const memory = minecraft ? defaults.memory : bulkMemory;
+      const disk = minecraft ? defaults.disk : bulkDisk;
+      const environment = Object.fromEntries(
+        eggVars(egg).map((variable: any) => [variable.env, variable.default || ""])
+      );
+      setBulkResults((current) =>
+        current.map((result) =>
+          result.eggId === egg.id
+            ? { ...result, status: "running", message: "Provisioning server" }
+            : result
+        )
+      );
+      const payload: any = {
+        name: `${bulkPrefix.trim() ? `${bulkPrefix.trim()} · ` : ""}${egg.name}`,
+        description: `Provisioned from the ${egg.name} egg by the catalogue installer.`,
+        egg_id: egg.id,
+        owner_id: bulkOwner,
+        node_id: bulkNode,
+        memory,
+        cpu: 100,
+        disk,
+        environment,
+        start_on_completion: bulkStart,
+      };
+      if (minecraft) {
+        payload.minecraft = {
+          software: egg.id === 28 ? "bedrock" : "paper",
+          version: "",
+          loader_version: "",
+          accept_eula: bulkEula,
+          properties: { motd: environment.MOTD || environment.SERVER_NAME || egg.name },
+        };
+        payload.accept_eula = bulkEula;
+      }
+      try {
+        const response: any = await api.adminCreateServer(payload);
+        created += 1;
+        setBulkResults((current) =>
+          current.map((result) =>
+            result.eggId === egg.id
+              ? {
+                  ...result,
+                  status: "created",
+                  message: response?.minecraft_job
+                    ? "Server created, Minecraft installation queued"
+                    : "Server provisioned",
+                  serverId: response?.data?.id,
+                }
+              : result
+          )
+        );
+      } catch (err: any) {
+        failed += 1;
+        setBulkResults((current) =>
+          current.map((result) =>
+            result.eggId === egg.id
+              ? {
+                  ...result,
+                  status: "failed",
+                  message: err?.message || "Provisioning failed",
+                }
+              : result
+          )
+        );
+      }
+    }
+    setBulkBusy(false);
+    await load();
+    notify(
+      failed
+        ? `${created} installed, ${failed} could not be provisioned`
+        : `${created} server${created === 1 ? "" : "s"} installed from the catalogue`,
+      failed ? "info" : "success"
+    );
+  }
 
   if (error) return <ErrorPanel message={error} retry={load} />;
   if (!nests) return <LoadingPage label="Loading nests" />;
@@ -1566,44 +1998,507 @@ export function Nests() {
       <PageHeader
         eyebrow="Administration"
         title="Nests & eggs"
-        description={`${nests.length} nests · ${eggs.length} eggs defining runtimes, files and startup variables.`}
-        actions={<button className="btn btn-ghost" onClick={load}><Icon name="arrows-rotate" /> Refresh</button>}
+        description={`${installedCount} of ${eggs.length} eggs installed · ${nests.length} nests · catalogue ${catalog.version || "2.0.0"}`}
+        actions={
+          <>
+            <button className="btn btn-ghost" onClick={load}><Icon name="arrows-rotate" /> Refresh</button>
+            <button
+              className="btn btn-primary"
+              onClick={() => openBulk(missingEggs.map((egg) => egg.id))}
+              disabled={!missingEggs.length}
+              title="Deploy one server from every egg that does not have a deployment yet"
+            >
+              <Icon name="cloud-arrow-down" /> Install all missing
+            </button>
+            <button className="btn" onClick={() => setNestOpen(true)}><Icon name="folder-plus" /> New nest</button>
+            <button className="btn" onClick={() => setEggOpen(true)}><Icon name="plus" /> New egg</button>
+            <button className="btn btn-ghost" disabled={syncing} onClick={syncCatalog}>
+              <Icon name={syncing ? "circle-notch" : "download"} className={syncing ? "spin" : ""} /> Sync catalogue
+            </button>
+          </>
+        }
       />
+      {catalogHealth?.repaired && (
+        <div className="banner banner-warning">
+          <Icon name="circle-info" />
+          <div>
+            <strong>Catalogue repaired</strong>
+            <span>
+              Missing built-in eggs were restored automatically. Minecraft Java and Bedrock are
+              available again, and new servers can be created normally.
+            </span>
+          </div>
+        </div>
+      )}
+      {catalogHealth && !catalogHealth.repaired && (catalogHealth.missing?.length || 0) > 0 && (
+        <div className="banner banner-error">
+          <Icon name="circle-exclamation" />
+          <div>
+            <strong>Built-in eggs are missing</strong>
+            <span>
+              Missing IDs: {catalogHealth.missing?.join(", ")}. Run Sync catalogue or redeploy the
+              current backend, then reload this page.
+            </span>
+          </div>
+        </div>
+      )}
+      <section className="catalogue-overview">
+        <div className="catalogue-overview-copy">
+          <span className="eyebrow">Deployment coverage</span>
+          <div className="catalogue-overview-count">
+            <strong>{installedCount}</strong>
+            <span>/ {eggs.length} eggs installed</span>
+          </div>
+          <p>
+            {missingEggs.length
+              ? `${missingEggs.length} egg${missingEggs.length === 1 ? "" : "s"} still need a first deployment.`
+              : "Every egg in the catalogue has at least one deployment."}
+          </p>
+        </div>
+        <div className="catalogue-overview-meter">
+          <div className="catalogue-meter-head">
+            <span>Coverage</span>
+            <strong>{coverage}%</strong>
+          </div>
+          <div className="catalogue-meter" role="img" aria-label={`${coverage}% of eggs installed`}>
+            <i style={{ width: `${coverage}%` }} />
+          </div>
+          <div className="catalogue-legend">
+            <span><i className="catalogue-dot installed" /> {installedCount} installed</span>
+            <span><i className="catalogue-dot missing" /> {missingEggs.length} not installed</span>
+          </div>
+        </div>
+      </section>
+
+      <div className="toolbar">
+        <div className="search-field">
+          <Icon name="magnifying-glass" />
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search nests, eggs, startup commands" />
+        </div>
+        <div className="segmented egg-filter">
+          {([
+            { id: "all", label: "All", count: eggs.length },
+            { id: "installed", label: "Installed", count: installedCount },
+            { id: "missing", label: "Not installed", count: missingEggs.length },
+          ] as const).map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              className={installFilter === item.id ? "active" : ""}
+              onClick={() => setInstallFilter(item.id)}
+            >
+              {item.label} <em>{item.count}</em>
+            </button>
+          ))}
+        </div>
+        <button
+          type="button"
+          className="btn btn-ghost btn-sm"
+          onClick={() => setSelectedEggs(missingEggs.map((egg) => egg.id))}
+          disabled={!missingEggs.length}
+        >
+          <Icon name="check-double" /> Select missing
+        </button>
+        <span className="pill pill-neutral">{visibleNests.length} nests shown</span>
+      </div>
+
+      {selectedEggs.length > 0 && (
+        <div className="selection-tray">
+          <span className="selection-tray-icon"><Icon name="layer-group" /></span>
+          <div className="selection-tray-copy">
+            <strong>{selectedEggs.length} egg{selectedEggs.length === 1 ? "" : "s"} selected</strong>
+            <span>Each selection becomes a separate server. Existing deployments are not touched.</span>
+          </div>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => setSelectedEggs([])}>
+            Clear
+          </button>
+          <button type="button" className="btn btn-primary" onClick={() => openBulk(selectedEggs)}>
+            <Icon name="cloud-arrow-down" /> Install selected
+          </button>
+        </div>
+      )}
       <div className="nest-list">
-        {nests.map((nest) => {
-          const nestEggs = eggs.filter((egg) => egg.nest_id === nest.id);
+        {visibleNests.length === 0 && (
+          <EmptyState
+            icon="layer-group"
+            title={installFilter === "missing" ? "Every egg is installed" : "No matching nests"}
+            description={
+              installFilter === "missing"
+                ? "All catalogue eggs already have at least one deployment."
+                : "Try another search or clear the installation filter."
+            }
+          />
+        )}
+        {visibleNests.map((nest) => {
+          const nestEggs = eggs.filter(
+            (egg) => egg.nest_id === nest.id && matchesInstallFilter(egg) && matchesSearch(egg, nest)
+          );
+          if (!nestEggs.length) return null;
+          const nestInstalled = nestEggs.filter(eggInstalled).length;
           return (
-            <section className="card" key={nest.id}>
+            <section className="card nest-card" key={nest.id}>
               <div className="card-head">
                 <div className="nest-title">
                   <span className="node-icon"><Icon name={eggIcon(nest.name)} brand={eggBrand(nest.name)} /></span>
                   <div><h2>{nest.name}</h2><p>{nest.description}</p></div>
                 </div>
-                <span className="pill pill-neutral">{nestEggs.length} egg{nestEggs.length === 1 ? "" : "s"}</span>
+                <div className="nest-head-meta">
+                  <span className="nest-count">
+                    <strong>{nestInstalled}</strong>
+                    <span>of {nestEggs.length} installed</span>
+                  </span>
+                  <span className="pill pill-neutral">{nestEggs.length} egg{nestEggs.length === 1 ? "" : "s"}{nest.id >= 1000 ? " · custom" : ""}</span>
+                </div>
               </div>
               <div className="egg-grid">
-                {nestEggs.map((egg) => (
-                  <article className="egg-tile" key={egg.id}>
-                    <div className="egg-tile-head">
-                      <strong>{egg.name}</strong>
-                      <span className={`pill pill-neutral`}>{egg.runtime}</span>
-                    </div>
-                    <p>{egg.description}</p>
-                    <div className="egg-tile-meta">
-                      <span><Icon name="cube" /> {egg.docker_image}</span>
-                      <span><Icon name="terminal" /> {egg.startup}</span>
-                    </div>
-                    <div className="egg-tile-foot">
-                      <span>{eggVars(egg).length} variable{eggVars(egg).length === 1 ? "" : "s"}</span>
-                      <code>egg #{egg.id}</code>
-                    </div>
-                  </article>
-                ))}
+                {nestEggs.map((egg, index) => {
+                  const installed = eggInstalled(egg);
+                  const deployments = Number(egg.deployments || 0);
+                  const selected = selectedEggs.includes(egg.id);
+                  return (
+                    <article
+                      className={`egg-tile ${installed ? "is-installed" : "is-missing"} ${selected ? "is-selected" : ""}`}
+                      key={egg.id}
+                      style={{ animationDelay: `${Math.min(index, 10) * 35}ms` }}
+                      onClick={() => toggleEgg(egg.id)}
+                    >
+                      <div className="egg-tile-head">
+                        <label className="egg-check" onClick={(event) => event.stopPropagation()}>
+                          <input
+                            type="checkbox"
+                            checked={selected}
+                            onChange={() => toggleEgg(egg.id)}
+                            aria-label={`Select ${egg.name}`}
+                          />
+                          <span className="checkbox-ui"><Icon name="check" /></span>
+                        </label>
+                        <div className="egg-tile-title">
+                          <strong className="egg-name">{egg.name}</strong>
+                          <span className="egg-tile-kicker">#{egg.id} · {egg.runtime} runtime</span>
+                        </div>
+                        <span className={`egg-status ${installed ? "installed" : "missing"}`}>
+                          <i />
+                          {installed ? "Installed" : "Not installed"}
+                        </span>
+                      </div>
+                      <p>{egg.description}</p>
+                      <div className="egg-tile-meta">
+                        <span><Icon name="cube" /> {egg.docker_image}</span>
+                        <span><Icon name="terminal" /> {egg.startup}</span>
+                      </div>
+                      <div className="egg-tile-foot">
+                        <span>
+                          {deployments
+                            ? `${deployments} deployment${deployments === 1 ? "" : "s"}`
+                            : "No deployments"} · {eggVars(egg).length} var{eggVars(egg).length === 1 ? "" : "s"}
+                        </span>
+                        <div className="egg-tile-actions">
+                          <Link
+                            className="btn btn-ghost btn-sm"
+                            to={`/admin/servers/new?egg=${egg.id}`}
+                            onClick={(event) => event.stopPropagation()}
+                          >
+                            <Icon name="sliders" /> Configure
+                          </Link>
+                          <button
+                            type="button"
+                            className="btn btn-sm egg-install-btn"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              openBulk([egg.id]);
+                            }}
+                          >
+                            <Icon name={installed ? "plus" : "cloud-arrow-down"} />
+                            {installed ? "Another" : "Install"}
+                          </button>
+                        </div>
+                      </div>
+                    </article>
+                  );
+                })}
               </div>
             </section>
           );
         })}
       </div>
+
+      <Modal open={nestOpen} onClose={() => setNestOpen(false)} title="Create nest" description="Custom nests use IDs above 1000 so catalog updates never overwrite them." footer={
+        <>
+          <button type="button" className="btn btn-ghost" onClick={() => setNestOpen(false)}>Cancel</button>
+          <button type="submit" form="create-nest" className="btn btn-primary" disabled={busy}>{busy ? "Saving" : "Create nest"}</button>
+        </>
+      }>
+        <form id="create-nest" className="form-grid" onSubmit={createNest}>
+          <div className="field full">
+            <label>Name</label>
+            <input value={nestForm.name} onChange={(event) => setNestForm({ ...nestForm, name: event.target.value })} required minLength={2} placeholder="Modpacks" />
+          </div>
+          <div className="field full">
+            <label>Description</label>
+            <input value={nestForm.description} onChange={(event) => setNestForm({ ...nestForm, description: event.target.value })} placeholder="What this nest contains" />
+          </div>
+        </form>
+      </Modal>
+
+      <Modal open={eggOpen} onClose={() => setEggOpen(false)} title="Create egg" description="A default Python health listener is installed if you do not supply files." footer={
+        <>
+          <button type="button" className="btn btn-ghost" onClick={() => setEggOpen(false)}>Cancel</button>
+          <button type="submit" form="create-egg" className="btn btn-primary" disabled={busy}>{busy ? "Saving" : "Create egg"}</button>
+        </>
+      }>
+        <form id="create-egg" className="form-grid" onSubmit={createEgg}>
+          <div className="field">
+            <label>Nest</label>
+            <select value={eggForm.nest_id} onChange={(event) => setEggForm({ ...eggForm, nest_id: Number(event.target.value) })}>
+              {nests.map((nest) => <option key={nest.id} value={nest.id}>{nest.name}</option>)}
+            </select>
+          </div>
+          <div className="field">
+            <label>Runtime</label>
+            <select value={eggForm.runtime} onChange={(event) => setEggForm({ ...eggForm, runtime: event.target.value })}>
+              <option value="process">process</option>
+              <option value="docker">docker</option>
+            </select>
+          </div>
+          <div className="field full">
+            <label>Name</label>
+            <input value={eggForm.name} onChange={(event) => setEggForm({ ...eggForm, name: event.target.value })} required minLength={2} placeholder="Custom HTTP" />
+          </div>
+          <div className="field full">
+            <label>Description</label>
+            <input value={eggForm.description} onChange={(event) => setEggForm({ ...eggForm, description: event.target.value })} placeholder="What this egg launches" />
+          </div>
+          <div className="field">
+            <label>Image</label>
+            <input className="mono" value={eggForm.docker_image} onChange={(event) => setEggForm({ ...eggForm, docker_image: event.target.value })} />
+          </div>
+          <div className="field">
+            <label>Startup</label>
+            <input className="mono" value={eggForm.startup} onChange={(event) => setEggForm({ ...eggForm, startup: event.target.value })} />
+          </div>
+        </form>
+      </Modal>
+
+      <Modal
+        open={bulkOpen}
+        onClose={closeBulk}
+        title="Install from the catalogue"
+        description="Each selected egg becomes one server. Existing deployments are not modified."
+        size="wide"
+        footer={
+          <>
+            <button type="button" className="btn btn-ghost" onClick={closeBulk} disabled={bulkBusy}>
+              {bulkFinished ? "Close" : "Cancel"}
+            </button>
+            {!bulkFinished && (
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={startBulk}
+                disabled={
+                  bulkBusy ||
+                  !bulkEggs.length ||
+                  !bulkOwner ||
+                  !bulkNode ||
+                  (bulkIncludesMinecraft && !bulkEula)
+                }
+              >
+                <Icon name={bulkBusy ? "circle-notch" : "cloud-arrow-down"} className={bulkBusy ? "spin" : ""} />
+                {bulkBusy ? "Installing" : `Install ${bulkEggs.length} egg${bulkEggs.length === 1 ? "" : "s"}`}
+              </button>
+            )}
+          </>
+        }
+      >
+        <div className="bulk-install">
+          <section className="bulk-plan">
+            <div className="bulk-plan-head">
+              <span className="eyebrow">Selected eggs</span>
+              <span className="pill pill-neutral">{bulkEggs.length} selected</span>
+            </div>
+            <div className="bulk-chip-row">
+              {bulkEggs.map((egg) => (
+                <span className={`bulk-chip ${eggInstalled(egg) ? "installed" : "missing"}`} key={egg.id}>
+                  <i />
+                  {egg.name}
+                </span>
+              ))}
+            </div>
+            <p>
+              Installed means at least one server already exists for that egg. Installing another
+              adds a new server without replacing the existing one.
+            </p>
+          </section>
+
+          <div className="form-grid">
+            <div className="field">
+              <label>Owner</label>
+              <select value={bulkOwner} onChange={(event) => setBulkOwner(Number(event.target.value))}>
+                <option value={0}>Select an account</option>
+                {users.map((user) => (
+                  <option key={user.id} value={user.id}>{user.username} · {user.email}</option>
+                ))}
+              </select>
+            </div>
+            <div className="field">
+              <label>Node</label>
+              <select value={bulkNode} onChange={(event) => setBulkNode(Number(event.target.value))}>
+                <option value={0}>Select a node</option>
+                {nodes.map((node) => (
+                  <option key={node.id} value={node.id}>
+                    {node.name} · {node.daemon === "connected" ? "online" : node.daemon || "unknown"}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="field full">
+              <label>Name prefix <span className="field-hint">optional</span></label>
+              <input
+                value={bulkPrefix}
+                onChange={(event) => setBulkPrefix(event.target.value)}
+                placeholder="Catalogue"
+                maxLength={40}
+              />
+              <span className="field-hint">
+                Example: {bulkPrefix.trim() ? `${bulkPrefix.trim()} · ` : ""}{bulkEggs[0]?.name || "Python Generic"}
+              </span>
+            </div>
+            <div className="field">
+              <label>Memory per application</label>
+              <input
+                type="number"
+                min={32}
+                step={32}
+                value={bulkMemory}
+                onChange={(event) => setBulkMemory(Math.max(32, Number(event.target.value) || 0))}
+              />
+              <span className="field-hint">Minecraft eggs keep their own minimum.</span>
+            </div>
+            <div className="field">
+              <label>Disk per application</label>
+              <input
+                type="number"
+                min={128}
+                step={128}
+                value={bulkDisk}
+                onChange={(event) => setBulkDisk(Math.max(128, Number(event.target.value) || 0))}
+              />
+              <span className="field-hint">MiB per non-Minecraft server.</span>
+            </div>
+          </div>
+
+          <div className={`bulk-capacity ${bulkOverCapacity ? "is-over" : ""}`}>
+            <div className="bulk-capacity-head">
+              <span className="eyebrow">Node capacity</span>
+              <span>{bulkNodeData ? `${bulkEggs.length} planned servers` : "Choose a node"}</span>
+            </div>
+            {bulkNodeData ? (
+              <>
+                <div className="bulk-capacity-row">
+                  <span>Memory</span>
+                  <strong>{fmtMiB(bulkPlan.memory)} <em>of {fmtMiB(bulkMemFree)} free</em></strong>
+                  <div className="bulk-capacity-track">
+                    <i
+                      className="memory"
+                      style={{ width: `${Math.min(100, (bulkPlan.memory / Math.max(bulkMemFree, 1)) * 100)}%` }}
+                    />
+                  </div>
+                </div>
+                <div className="bulk-capacity-row">
+                  <span>Disk</span>
+                  <strong>{fmtMiB(bulkPlan.disk)} <em>of {fmtMiB(bulkDiskFree)} free</em></strong>
+                  <div className="bulk-capacity-track">
+                    <i
+                      className="disk"
+                      style={{ width: `${Math.min(100, (bulkPlan.disk / Math.max(bulkDiskFree, 1)) * 100)}%` }}
+                    />
+                  </div>
+                </div>
+                {bulkOverCapacity && (
+                  <p className="bulk-capacity-warning">
+                    This plan exceeds the node's current free capacity. Lower the per-application
+                    resources, choose another node, or install fewer eggs. Capacity failures are
+                    reported per server.
+                  </p>
+                )}
+              </>
+            ) : (
+              <p className="bulk-capacity-warning">Select a node to calculate the capacity plan.</p>
+            )}
+          </div>
+
+          <div className="bulk-options">
+            <label className="check-row">
+              <input type="checkbox" checked={bulkStart} onChange={(event) => setBulkStart(event.target.checked)} />
+              <span className="checkbox-ui"><Icon name="check" /></span>
+              <span>Start each server after provisioning</span>
+            </label>
+            {bulkIncludesMinecraft && (
+              <label className="check-row">
+                <input type="checkbox" checked={bulkEula} onChange={(event) => setBulkEula(event.target.checked)} />
+                <span className="checkbox-ui"><Icon name="check" /></span>
+                <span>
+                  I accept the{" "}
+                  <a href="https://www.minecraft.net/eula" target="_blank" rel="noreferrer">
+                    Minecraft EULA
+                  </a>{" "}
+                  for the Minecraft servers in this batch
+                </span>
+              </label>
+            )}
+          </div>
+
+          {(bulkStarted || bulkBusy) && (
+            <div className="bulk-progress">
+              <div className="bulk-progress-head">
+                <span className="eyebrow">Provisioning</span>
+                <span>
+                  {bulkResults.filter((result) => result.status !== "pending" && result.status !== "running").length}
+                  {" / "}
+                  {bulkResults.length}
+                </span>
+              </div>
+              <div className="bulk-progress-track">
+                <i
+                  style={{
+                    width: `${(bulkResults.filter((result) => result.status === "created" || result.status === "failed").length / Math.max(bulkResults.length, 1)) * 100}%`,
+                  }}
+                />
+              </div>
+              <div className="bulk-results">
+                {bulkResults.map((result) => (
+                  <div className={`bulk-result is-${result.status}`} key={result.eggId}>
+                    <span className="bulk-result-icon">
+                      <Icon
+                        name={
+                          result.status === "created"
+                            ? "circle-check"
+                            : result.status === "failed"
+                              ? "circle-exclamation"
+                              : result.status === "running"
+                                ? "circle-notch"
+                                : "clock"
+                        }
+                        className={result.status === "running" ? "spin" : ""}
+                      />
+                    </span>
+                    <strong>{result.name}</strong>
+                    <span>{result.message}</span>
+                    {result.serverId && <Link to={`/server/${result.serverId}`}>Open server</Link>}
+                  </div>
+                ))}
+              </div>
+              {bulkFinished && (
+                <p className={`bulk-outcome ${bulkFailed ? "has-failures" : "is-clean"}`}>
+                  {bulkFailed
+                    ? `${bulkCreated} installed, ${bulkFailed} could not be provisioned. The results above include the reason for each failure.`
+                    : `${bulkCreated} server${bulkCreated === 1 ? "" : "s"} installed successfully.`}
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+      </Modal>
     </div>
   );
 }

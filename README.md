@@ -2,11 +2,13 @@
 
 VITESTERTL is a Debian-first, self-hosted control plane for application and game servers. It pairs a FastAPI panel with a responsive React interface and a local node runtime covering the day-to-day work of running workloads: live console, resource telemetry, file management, backups, schedules, databases, allocations, subusers, and a complete audit trail.
 
-Version **1.9.0** adds first-class Minecraft provisioning: automated Java and Bedrock installations from official upstream metadata, loader-aware plugin and mod management through Modrinth, live server-list status, and a refreshed sign-in surface with original Minecraft-inspired artwork.
+Version **2.0.0** focuses on operational maturity: self-healing egg catalogues, safe Minecraft version upgrades with automatic pre-upgrade backups, Modrinth plugin and mod update detection, a standard five-field cron scheduler, and the existing first-class Java and Bedrock provisioning workflow.
 
 ## Highlights
 
 - **Minecraft servers** — install Vanilla, Paper, Purpur, Folia, Fabric, Quilt, Forge, NeoForge, Velocity, Waterfall, BungeeCord, or Bedrock Dedicated Server, choose the Minecraft version and loader build, accept the EULA, edit `server.properties`, query live status, and install plugins or mods from Modrinth or local uploads.
+- **Safe maintenance** — compare installed server software with the current upstream release, upgrade with one click, and keep an automatic pre-upgrade backup. Check tracked plugins and mods for newer compatible Modrinth builds and update them individually.
+- **Catalogue integrity** — built-in nests and eggs are upserted on startup and repaired automatically if a database row is missing, so Minecraft Java egg 27 and Bedrock egg 28 remain available after an upgrade.
 - **Operations dashboard** — fleet health, node capacity, workload filters, live CPU/memory/disk figures, and recent activity.
 - **Server workspace** — console over WebSocket, power controls, command input, file editor and uploads, backups with download and restore, cron schedules, databases, network allocations, startup variables, access lists, and settings.
 - **Node management** — auto-install the local Debian host, inspect capacity, regenerate daemon tokens, copy the node configuration, and manage allocations in bulk.
@@ -91,6 +93,8 @@ sudo bash deploy/install.sh --domain panel.example.com --with-docker
 ```
 
 The installer preserves an existing `/etc/vitestl.env` and `/var/lib/vitestl` database. It rebuilds the frontend and restarts the service.
+
+Version 2.0.0 migrates the schedules table automatically and upserts the built-in nests and eggs during startup. If a panel upgrade ever leaves an egg missing, open **Administration → Nests & eggs** and use **Sync catalogue**; missing built-in rows are also repaired the first time the catalogue is read.
 
 ## Node auto-install
 
@@ -231,7 +235,27 @@ Every server download is HTTPS-only and host-validated. Transient failures are r
 
 Installations run as background jobs with live progress and logs. Existing worlds, plugins, mods, and configuration are preserved on reinstall. The panel writes the EULA choice, `server.properties`, and a restart-safe start script, and selects a matching Java runtime image from the version metadata. Java and Bedrock editions use different server directories and cannot share a single workload; choose the edition when creating the server.
 
-The **Minecraft** tab shows the installed build, live Java server-list or Bedrock RakNet status, and editable gameplay properties. The **Content** tab installs plugins or mods from Modrinth using the catalogues and loaders appropriate to the selected software. It can also toggle or remove installed files and accept `.jar` or `.zip` uploads. Vanilla, Bedrock, and proxy software expose only the capabilities that apply to them.
+The **Minecraft** tab shows the installed build, live Java server-list or Bedrock RakNet status, and editable gameplay properties. When a newer release or loader build is available, the maintenance card offers a one-click upgrade. The server is stopped first, a full backup is written, and the new binary is installed while worlds, plugins, mods, `server.properties` and the EULA decision are preserved.
+
+The **Content** tab installs plugins or mods from Modrinth using the catalogues and loaders appropriate to the selected software. **Check updates** compares every tracked Modrinth project with the latest build compatible with the installed Minecraft version and loader; update buttons replace the old archive and keep disabled files disabled. The tab can also toggle or remove installed files and accept `.jar` or `.zip` uploads. Vanilla, Bedrock, and proxy software expose only the capabilities that apply to them.
+
+If an older installation is missing built-in eggs, opening **Administration → Nests & eggs**, or creating a server, re-syncs the catalogue before failing. The API error includes the requested egg ID and the known built-in IDs, which distinguishes a stale deployment from an invalid request.
+
+## Scheduled automation
+
+Schedules use standard five-field cron expressions in UTC: minute, hour, day of month, month, and weekday (Sunday is `0` or `7`). The interface includes presets for hourly, six-hourly, daily, weekly, and monthly maintenance, plus a free-form expression field. Actions cover start, stop, restart, kill, backup, and console commands. Each row stores its next run time, so a restart does not duplicate or skip work.
+
+Examples:
+
+| Expression | Meaning |
+|------------|---------|
+| `*/15 * * * *` | Every 15 minutes |
+| `0 * * * *` | Every hour at minute 0 |
+| `0 4 * * *` | Daily at 04:00 UTC |
+| `0 4 * * 0` | Every Sunday at 04:00 UTC |
+| `0 4 1 * *` | The first day of each month at 04:00 UTC |
+
+Legacy `*/N * * * *` rows created by earlier releases continue to work, including the non-standard values above 59 minutes that older panels accepted.
 
 ## Security checklist
 
@@ -255,7 +279,10 @@ All panel routes live under `/api`:
 - Files, startup, settings, reinstall, databases, backups, schedules, network, subusers
 - `GET /api/minecraft/catalog`, version and loader catalogues, Minecraft status and install jobs
 - `GET|PUT /api/servers/{id}/minecraft/properties`, `POST /api/servers/{id}/minecraft/install`
+- `GET /api/servers/{id}/minecraft/update`, `POST /api/servers/{id}/minecraft/upgrade`
 - Plugin and mod search, versions, install, upload, toggle, and delete under `/api/servers/{id}/plugins`
+- `GET /api/servers/{id}/plugins/updates`, `POST /api/servers/{id}/plugins/{filename}/update`
+- `GET /api/admin/nests` returns `catalog_health`; `POST /api/admin/nests/sync` repairs built-in nests and eggs
 - `GET /api/admin/overview`, users, nodes, allocations, locations, nests, activity, settings
 - `GET /api/admin/node-installer/audit`
 - `POST /api/admin/node-installer/install`
@@ -268,6 +295,7 @@ Interactive API documentation is available at **http://localhost:8000/docs** whi
 
 - **Port already in use** — stop the previous panel or frontend process, or change the port in `start.sh`, the uvicorn command, and `frontend/vite.config.ts`.
 - **Blank page or missing icons** — run `npm install` in `frontend/` and rebuild. Fonts and icons are resolved from `node_modules`, so a partial install breaks asset loading.
+- **`Unknown egg` when creating a Minecraft server** — the panel could not find the requested egg in both SQLite and the bundled catalogue, which means the running backend is older than the frontend or the catalogue rows were deleted. Run `sudo bash deploy/install.sh` to rebuild and restart the service, then open **Administration → Nests & eggs → Sync catalogue**. Version 2.0.0 also repairs missing built-in eggs automatically and includes the submitted egg ID in the error message.
 - **Node shows `awaiting`** — the node must match the panel hostname (or `localhost`/`127.0.0.1`). Run the auto-installer again to repair the local node record.
 - **Docker eggs fall back to process mode** — install Docker with `--with-docker` and verify `systemctl status docker` and `docker info`.
 - **Processes do not start on Windows** — the process runtime uses POSIX process groups. Use Linux for workload execution.

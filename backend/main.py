@@ -6,8 +6,10 @@ import hashlib
 import json
 import os
 import platform
+import re
 import secrets
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -15,6 +17,7 @@ import tarfile
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -68,12 +71,15 @@ from db import (
 from eggs import NESTS, EGGS, default_egg_files, egg_by_id
 from minecraft import MinecraftError
 from minecraft import catalog as minecraft_catalog
+from minecraft import check_update as minecraft_check_update
 from minecraft import content_capabilities as minecraft_capabilities
+from minecraft import content_update as minecraft_content_update
 from minecraft import install_content as minecraft_install_content
 from minecraft import install_server as minecraft_install_server
 from minecraft import installed_content as minecraft_installed_content
 from minecraft import java_status as minecraft_java_status
 from minecraft import bedrock_status as minecraft_bedrock_status
+from minecraft import latest_release as minecraft_latest_release
 from minecraft import read_install_metadata as minecraft_install_metadata
 from minecraft import read_server_properties as minecraft_read_properties
 from minecraft import search_content as minecraft_search_content
@@ -174,6 +180,21 @@ class MinecraftInstallBody(BaseModel):
 
 class MinecraftPropertiesBody(BaseModel):
     properties: dict[str, Any] = {}
+
+
+class MinecraftUpgradeBody(BaseModel):
+    version: str = ""
+    loader_version: str | None = None
+    accept_eula: bool = False
+    backup: bool = True
+
+
+class TerminalSudoBody(BaseModel):
+    enabled: bool
+
+
+class PluginUpdateBody(BaseModel):
+    version_id: str | None = None
 
 
 class PluginInstallBody(BaseModel):
@@ -352,6 +373,40 @@ def load_egg(egg_id: int) -> dict[str, Any] | None:
     return egg_by_id(egg_id)
 
 
+def resolve_egg(egg_id: int) -> dict[str, Any] | None:
+    """Resolve an egg and repair the built-in catalogue when a row is missing.
+
+    ``load_egg`` falls back to the static catalogue so requests keep working
+    during a rolling upgrade. The database row still has to exist because
+    servers, nests and administration screens join against it. Re-syncing here
+    makes the fallback self-healing instead of leaving an orphaned server.
+    """
+    with db() as conn:
+        row = conn.execute("SELECT id FROM eggs WHERE id = ?", (egg_id,)).fetchone()
+    if not row:
+        with db() as conn:
+            sync_catalog(conn)
+    return load_egg(egg_id)
+
+
+def builtin_egg_ids() -> list[int]:
+    return sorted(int(egg["id"]) for egg in EGGS)
+
+
+def catalog_health(conn: Any) -> dict[str, Any]:
+    expected = {int(egg["id"]) for egg in EGGS}
+    installed = {
+        int(row["id"])
+        for row in conn.execute("SELECT id FROM eggs").fetchall()
+        if int(row["id"]) in expected
+    }
+    return {
+        "expected": len(expected),
+        "installed": len(installed),
+        "missing": sorted(expected - installed),
+    }
+
+
 def hash_api_key(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -464,6 +519,182 @@ def reject_suspended(server: dict[str, Any]) -> None:
         reason = (server.get("suspended_reason") or "").strip()
         detail = "This server is suspended." + (f" {reason}" if reason else "")
         raise HTTPException(403, detail)
+
+
+# ---------------------------------------------------------------------------
+# Owner terminal
+# ---------------------------------------------------------------------------
+
+TERMINAL_TIMEOUT = 120
+TERMINAL_OUTPUT_LIMIT = 1024 * 1024
+TERMINAL_COMMAND_LIMIT = 4096
+TERMINAL_CD_RE = re.compile(r"^\s*cd(?:\s+(.*?))?\s*$")
+
+
+def terminal_allowed(server: dict[str, Any], user: dict[str, Any]) -> bool:
+    """The terminal is deliberately narrower than normal server access.
+
+    Subusers get the console and file manager, but shell access on the panel
+    host stays with the owner and administrators.
+    """
+
+    return user.get("role") == "admin" or int(server.get("owner_id") or 0) == int(
+        user.get("id") or 0
+    )
+
+
+def require_terminal(server: dict[str, Any], user: dict[str, Any]) -> None:
+    if not terminal_allowed(server, user):
+        raise HTTPException(403, "Terminal access is limited to the server owner and administrators")
+
+
+def terminal_root(server_id: str) -> Path:
+    root = SERVERS_DIR / server_id
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve()
+
+
+def sudo_available() -> bool:
+    return os.name != "nt" and shutil.which("sudo") is not None
+
+
+def terminal_shell_name() -> str:
+    return "powershell" if os.name == "nt" else "bash"
+
+
+def terminal_relative(path: Path, root: Path) -> str:
+    try:
+        rel = path.resolve().relative_to(root)
+    except (ValueError, OSError):
+        return "/"
+    value = rel.as_posix().strip("/")
+    return "/" + value if value else "/"
+
+
+def terminal_resolve_directory(root: Path, current: Path, argument: str) -> Path:
+    raw = (argument or "").strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+        raw = raw[1:-1]
+    if raw in ("", "~"):
+        target = root
+    elif raw.startswith("/"):
+        # A leading slash is rooted at the server directory, not the host.
+        target = (root / raw.lstrip("/")).resolve()
+    else:
+        target = (current / raw).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("the path leaves this server's directory") from exc
+    if not target.is_dir():
+        raise ValueError("no such directory")
+    return target
+
+
+def terminal_environment(root: Path, server_id: str, server_name: str) -> dict[str, str]:
+    if os.name == "nt":
+        env = {
+            key: os.environ[key]
+            for key in ("SystemRoot", "WINDIR", "ComSpec", "PATHEXT", "TEMP", "TMP", "USERPROFILE")
+            if os.environ.get(key)
+        }
+        env.setdefault("PATH", os.environ.get("PATH", ""))
+        env["HOME"] = str(root)
+    else:
+        env = {
+            "PATH": os.environ.get(
+                "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            ),
+            "HOME": str(root),
+            "USER": os.environ.get("USER", "vitestl"),
+            "LOGNAME": os.environ.get("LOGNAME") or os.environ.get("USER", "vitestl"),
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+            "TERM": "xterm-256color",
+        }
+    env.update(
+        {
+            "SERVER_ID": server_id,
+            "SERVER_NAME": server_name,
+            "SERVER_DIR": str(root),
+            "PYTHONUNBUFFERED": "1",
+        }
+    )
+    return env
+
+
+def terminal_payload(server: dict[str, Any], user: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "user": user.get("username") or "operator",
+        "server": server.get("name") or "server",
+        "cwd": "/",
+        "root": "/",
+        "sudo": bool(server.get("terminal_sudo")),
+        "can_toggle_sudo": user.get("role") == "admin",
+        "sudo_available": sudo_available(),
+        "shell": terminal_shell_name(),
+        "platform": platform.system(),
+        "timeout_seconds": TERMINAL_TIMEOUT,
+    }
+
+
+async def sudo_ready() -> tuple[bool, str]:
+    if not sudo_available():
+        return False, "sudo is not installed on this node"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "sudo",
+            "-n",
+            "true",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=4)
+    except (OSError, asyncio.TimeoutError) as exc:
+        return False, f"sudo could not be verified: {exc}"
+    if proc.returncode == 0:
+        return True, ""
+    detail = stderr.decode("utf-8", errors="replace").strip().splitlines()
+    reason = detail[-1] if detail else "a password is required"
+    return (
+        False,
+        f"Non-interactive sudo is unavailable ({reason}). Configure NOPASSWD in sudoers "
+        "for the panel service account before enabling this control.",
+    )
+
+
+def signal_terminal_process(proc: asyncio.subprocess.Process, force: bool = False) -> None:
+    if proc.returncode is not None:
+        return
+    if os.name == "nt":
+        if force:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        else:
+            proc.terminate()
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL if force else signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill() if force else proc.terminate()
+        except (ProcessLookupError, OSError):
+            pass
+
+
+async def terminate_terminal_process(proc: asyncio.subprocess.Process) -> None:
+    signal_terminal_process(proc, force=False)
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=1.5)
+    except asyncio.TimeoutError:
+        signal_terminal_process(proc, force=True)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=3)
+        except asyncio.TimeoutError:
+            pass
 
 
 def node_connected(node: dict[str, Any]) -> bool:
@@ -1103,7 +1334,7 @@ def _run_node_install(job_id: str, body: dict[str, Any], admin_id: int | None) -
 
 
 def install_egg_files(server_id: str, egg_id: int, env: dict[str, str]) -> None:
-    egg = load_egg(egg_id)
+    egg = resolve_egg(egg_id)
     if not egg:
         return
     root = SERVERS_DIR / server_id
@@ -1645,37 +1876,159 @@ async def schedule_loop() -> None:
             continue
 
 
+def _parse_utc(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _cron_field_matches(spec: str, value: int, minimum: int, maximum: int) -> bool:
+    spec = (spec or "*").strip()
+    if spec in ("*", "?"):
+        return True
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        step = 1
+        if "/" in token:
+            base, step_text = token.split("/", 1)
+            try:
+                step = max(1, int(step_text))
+            except ValueError:
+                continue
+        else:
+            base = token
+        if base in ("*", "?"):
+            start, end = minimum, maximum
+        elif "-" in base:
+            try:
+                start_text, end_text = base.split("-", 1)
+                start, end = int(start_text), int(end_text)
+            except ValueError:
+                continue
+        else:
+            try:
+                start = end = int(base)
+            except ValueError:
+                continue
+        if start > end:
+            start, end = end, start
+        if start < minimum or end > maximum:
+            continue
+        if start <= value <= end and (value - start) % step == 0:
+            return True
+    return False
+
+
+def _legacy_interval(expr: str) -> int | None:
+    """Interpret the historical ``*/N * * * *`` form as a minute interval.
+
+    Values above 59 were accepted by older panel releases even though they are
+    not valid cron minutes. Keep them working after the scheduler upgrade.
+    """
+    fields = (expr or "").split()
+    if len(fields) != 5 or fields[1:] != ["*", "*", "*", "*"]:
+        return None
+    head = fields[0]
+    if not head.startswith("*/"):
+        return None
+    try:
+        minutes = int(head[2:])
+    except ValueError:
+        return None
+    if minutes > 59:
+        return max(60, minutes * 60)
+    return None
+
+
+def cron_next(expr: str, after: datetime | None = None) -> datetime:
+    """Return the next UTC minute matching a standard five-field cron expression."""
+    base = (after or datetime.now(timezone.utc)).replace(second=0, microsecond=0)
+    legacy = _legacy_interval(expr)
+    if legacy:
+        return base + timedelta(seconds=legacy)
+    fields = (expr or "").split()
+    if len(fields) != 5:
+        return base + timedelta(minutes=5)
+    minute, hour, day, month, weekday = fields
+    candidate = base + timedelta(minutes=1)
+    for _ in range(60 * 24 * 366):
+        cron_weekday = (candidate.weekday() + 1) % 7  # Sunday = 0
+        day_restricted = day.strip() not in ("*", "?")
+        weekday_restricted = weekday.strip() not in ("*", "?")
+        day_match = _cron_field_matches(day, candidate.day, 1, 31)
+        weekday_match = _cron_field_matches(weekday, cron_weekday, 0, 6) or (
+            cron_weekday == 0 and _cron_field_matches(weekday, 7, 0, 7)
+        )
+        # Vixie cron treats day-of-month and day-of-week as an OR when both
+        # are restricted, and as an AND otherwise.
+        if day_restricted and weekday_restricted:
+            date_match = day_match or weekday_match
+        else:
+            date_match = day_match and weekday_match
+        if (
+            date_match
+            and _cron_field_matches(month, candidate.month, 1, 12)
+            and _cron_field_matches(hour, candidate.hour, 0, 23)
+            and _cron_field_matches(minute, candidate.minute, 0, 59)
+        ):
+            return candidate
+        candidate += timedelta(minutes=1)
+    return base + timedelta(minutes=5)
+
+
+def schedule_next_run(expr: str, after: datetime | None = None) -> str:
+    return cron_next(expr, after).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 async def run_due_schedules() -> None:
-    now = time.time()
+    now = datetime.now(timezone.utc)
     with db() as conn:
         rows = rows_to_list(conn.execute("SELECT * FROM schedules WHERE enabled = 1").fetchall())
     for sch in rows:
-        last = sch.get("last_run")
-        interval = parse_cron_interval(sch.get("cron") or "*/5 * * * *")
-        due = True
-        if last:
-            try:
-                # last is iso
-                from datetime import datetime, timezone
-
-                dt = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                due = (now - dt.timestamp()) >= interval
-            except Exception:
-                due = True
-        if not due:
+        expr = sch.get("cron") or "*/5 * * * *"
+        last_run = _parse_utc(sch.get("last_run"))
+        next_run = _parse_utc(sch.get("next_run"))
+        interval = _legacy_interval(expr)
+        if next_run is None:
+            base = last_run or now
+            next_run = (
+                base + timedelta(seconds=interval)
+                if interval
+                else cron_next(expr, base)
+            )
+        if now < next_run:
+            if sch.get("next_run") != next_run.strftime("%Y-%m-%dT%H:%M:%SZ"):
+                with db() as conn:
+                    conn.execute(
+                        "UPDATE schedules SET next_run = ? WHERE id = ?",
+                        (next_run.strftime("%Y-%m-%dT%H:%M:%SZ"), sch["id"]),
+                    )
             continue
         server_id = sch["server_id"]
         with db() as conn:
             row = conn.execute("SELECT * FROM servers WHERE id = ?", (server_id,)).fetchone()
             server = row_to_dict(row)
         if not server or server.get("suspended"):
+            with db() as conn:
+                conn.execute(
+                    "UPDATE schedules SET next_run = ? WHERE id = ?",
+                    (schedule_next_run(expr, now), sch["id"]),
+                )
             continue
         try:
             await execute_schedule_action(server, sch)
         except Exception:
             pass
         with db() as conn:
-            conn.execute("UPDATE schedules SET last_run = ? WHERE id = ?", (utcnow(), sch["id"]))
+            conn.execute(
+                "UPDATE schedules SET last_run = ?, next_run = ? WHERE id = ?",
+                (utcnow(), schedule_next_run(expr, now), sch["id"]),
+            )
 
 
 async def execute_schedule_action(server: dict[str, Any], sch: dict[str, Any]) -> None:
@@ -1694,17 +2047,6 @@ async def execute_schedule_action(server: dict[str, Any], sch: dict[str, Any]) -
         create_backup_file(server, name=f"schedule-{sch['name']}")
     elif action == "command" and sch.get("payload"):
         await inst.send(sch["payload"])
-
-
-def parse_cron_interval(expr: str) -> int:
-    expr = (expr or "").strip()
-    if expr.startswith("*/") and " " in expr:
-        try:
-            n = int(expr.split()[0][2:])
-            return max(60, n * 60)
-        except ValueError:
-            return 300
-    return 300
 
 
 @app.get("/api/system")
@@ -1893,6 +2235,54 @@ def list_servers(user: dict[str, Any] = Depends(user_from_header)) -> dict[str, 
 @app.get("/api/servers/{server_id}")
 def show_server(server_id: str, user: dict[str, Any] = Depends(user_from_header)) -> dict[str, Any]:
     return {"data": decorate_server(get_server(server_id, user))}
+
+
+@app.get("/api/servers/{server_id}/terminal")
+def server_terminal_info(
+    server_id: str, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    require_terminal(server, user)
+    terminal_root(server_id)
+    return {"data": terminal_payload(server, user)}
+
+
+@app.post("/api/servers/{server_id}/terminal/sudo")
+async def server_terminal_sudo(
+    server_id: str,
+    body: TerminalSudoBody,
+    admin: dict[str, Any] = Depends(admin_user),
+) -> dict[str, Any]:
+    server = get_server(server_id, admin)
+    reject_suspended(server)
+    terminal_root(server_id)
+    if body.enabled:
+        ready, reason = await sudo_ready()
+        if not ready:
+            raise HTTPException(400, reason)
+    with db() as conn:
+        conn.execute(
+            "UPDATE servers SET terminal_sudo = ? WHERE id = ?",
+            (1 if body.enabled else 0, server_id),
+        )
+        row = conn.execute(
+            """SELECT s.*, e.name AS egg_name, n.name AS nest_name, u.username AS owner_name
+               FROM servers s
+               JOIN eggs e ON e.id = s.egg_id
+               JOIN nests n ON n.id = e.nest_id
+               JOIN users u ON u.id = s.owner_id
+               WHERE s.id = ?""",
+            (server_id,),
+        ).fetchone()
+    updated = row_to_dict(row) or server
+    log_activity(
+        admin["id"],
+        server_id,
+        "server:terminal-sudo",
+        {"enabled": bool(body.enabled)},
+    )
+    return {"data": terminal_payload(updated, admin)}
 
 
 @app.get("/api/servers/{server_id}/resources")
@@ -2316,6 +2706,94 @@ def server_minecraft_job(
     return {"data": job}
 
 
+@app.get("/api/servers/{server_id}/minecraft/update")
+async def server_minecraft_update(
+    server_id: str, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    software_id = _server_mc_software(server)
+    if not software_id:
+        raise HTTPException(400, "This server is not a Minecraft workload")
+    try:
+        result = await asyncio.to_thread(
+            minecraft_check_update,
+            software_id,
+            str(server.get("mc_version") or ""),
+            str(server.get("mc_loader_version") or ""),
+        )
+    except MinecraftError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return {"data": result}
+
+
+@app.post("/api/servers/{server_id}/minecraft/upgrade")
+async def server_minecraft_upgrade(
+    server_id: str,
+    body: MinecraftUpgradeBody,
+    user: dict[str, Any] = Depends(user_from_header),
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    software_id = _server_mc_software(server)
+    if not software_id:
+        raise HTTPException(400, "This server is not a Minecraft workload")
+    active = _latest_mc_job(server_id)
+    if active and active.get("status") in ("queued", "running"):
+        raise HTTPException(409, "An installation or upgrade is already running")
+    try:
+        latest = await asyncio.to_thread(minecraft_latest_release, software_id)
+    except MinecraftError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    version = (body.version or latest["version"]).strip()[:80]
+    if not version:
+        raise HTTPException(400, "A target Minecraft version is required")
+    loader = body.loader_version if body.loader_version is not None else latest["loader_version"]
+    accept_eula = bool(body.accept_eula) or bool(server.get("mc_eula"))
+    try:
+        config = _mc_config(
+            {
+                "software": software_id,
+                "version": version,
+                "loader_version": loader,
+                "accept_eula": accept_eula,
+                "properties": {},
+            },
+            software_id,
+        )
+    except MinecraftError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    current_meta = minecraft_software(software_id)
+    if current_meta["kind"] == "server" and config["edition"] != current_meta["edition"]:
+        raise HTTPException(400, "Java and Bedrock editions cannot share one server directory")
+
+    instance = manager.instances.get(server_id)
+    if instance and instance.proc and instance.proc.returncode is None:
+        await instance.stop(kill=False)
+
+    backup: dict[str, Any] | None = None
+    if body.backup:
+        label = f"pre-upgrade-{server.get('mc_version') or 'unknown'}-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}"
+        try:
+            backup = await asyncio.to_thread(create_backup_file, server, label)
+        except OSError as exc:
+            raise HTTPException(500, f"Upgrade backup failed: {exc}") from exc
+
+    job = await _begin_mc_install(server, config, user["id"])
+    log_activity(
+        user["id"],
+        server_id,
+        "minecraft:upgrade",
+        {
+            "from_version": server.get("mc_version") or "",
+            "to_version": version,
+            "from_loader": server.get("mc_loader_version") or "",
+            "to_loader": loader or "",
+            "backup": (backup or {}).get("id"),
+        },
+    )
+    return {"data": job, "backup": backup}
+
+
 @app.put("/api/servers/{server_id}/minecraft/properties")
 def server_minecraft_properties(
     server_id: str,
@@ -2449,6 +2927,153 @@ async def server_plugin_install(
         "filename": info.get("filename"),
     })
     return {"data": info}
+
+
+@app.get("/api/servers/{server_id}/plugins/updates")
+async def server_plugin_updates(
+    server_id: str, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    software_id = _server_mc_software(server)
+    if not software_id:
+        raise HTTPException(400, "This server is not a Minecraft workload")
+    capabilities = minecraft_capabilities(software_id)
+    if not capabilities["enabled"]:
+        return {"data": [], "checked": 0, "errors": []}
+    rows = _merge_installed_content(server_id, software_id)
+    tracked = [row for row in rows if row.get("project_id")]
+    game_version = str(server.get("mc_version") or "")
+    semaphore = asyncio.Semaphore(4)
+
+    async def inspect(item: dict[str, Any]) -> dict[str, Any]:
+        async with semaphore:
+            try:
+                latest = await asyncio.to_thread(
+                    minecraft_content_update,
+                    software_id,
+                    str(item["project_id"]),
+                    str(item.get("version_id") or ""),
+                    game_version=game_version,
+                )
+            except MinecraftError as exc:
+                return {
+                    "filename": item["filename"],
+                    "title": item.get("title") or item.get("base_name"),
+                    "project_id": item.get("project_id") or "",
+                    "error": str(exc)[:240],
+                }
+        if not latest:
+            return {}
+        return {
+            "filename": item["filename"],
+            "base_name": item.get("base_name") or item["filename"],
+            "title": item.get("title") or item.get("base_name"),
+            "project_id": item.get("project_id") or "",
+            "project_slug": item.get("project_slug") or "",
+            "icon_url": item.get("icon_url") or "",
+            "current_version_id": item.get("version_id") or "",
+            "current_version": item.get("version_number") or "",
+            "latest": latest,
+            "enabled": bool(item.get("enabled")),
+        }
+
+    results = await asyncio.gather(*(inspect(row) for row in tracked))
+    updates = [row for row in results if row and row.get("latest")]
+    errors = [row for row in results if row and row.get("error")]
+    return {
+        "data": updates,
+        "checked": len(tracked),
+        "errors": errors,
+        "project_type": capabilities["project_type"],
+    }
+
+
+@app.post("/api/servers/{server_id}/plugins/{filename}/update")
+async def server_plugin_update(
+    server_id: str,
+    filename: str,
+    body: PluginUpdateBody,
+    user: dict[str, Any] = Depends(user_from_header),
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    software_id = _server_mc_software(server)
+    if not software_id:
+        raise HTTPException(400, "This server is not a Minecraft workload")
+    capabilities = minecraft_capabilities(software_id)
+    if not capabilities["enabled"]:
+        raise HTTPException(400, "This server software does not support plugins or mods")
+    rows = _merge_installed_content(server_id, software_id)
+    item = next(
+        (row for row in rows if filename in (row.get("filename"), row.get("base_name"))),
+        None,
+    )
+    if not item:
+        raise HTTPException(404, "Installed content was not found")
+    if not item.get("project_id"):
+        raise HTTPException(400, "This file was uploaded locally and has no upstream project")
+
+    version_id = (body.version_id or "").strip()
+    if not version_id:
+        try:
+            latest = await asyncio.to_thread(
+                minecraft_content_update,
+                software_id,
+                str(item["project_id"]),
+                str(item.get("version_id") or ""),
+                game_version=str(server.get("mc_version") or ""),
+            )
+        except MinecraftError as exc:
+            raise HTTPException(502, str(exc)) from exc
+        if not latest:
+            return {"data": item, "updated": False, "message": "Already up to date"}
+        version_id = str(latest["id"])
+
+    old_filename = str(item["filename"])
+    was_enabled = bool(item.get("enabled"))
+    root = SERVERS_DIR / server_id
+    try:
+        info = await asyncio.to_thread(
+            minecraft_install_content,
+            root,
+            software_id,
+            str(item["project_id"]),
+            version_id=version_id,
+            game_version=str(server.get("mc_version") or ""),
+            log=lambda line: None,
+        )
+        if not was_enabled:
+            toggled = minecraft_toggle_content(root, software_id, str(info["filename"]))
+            info["filename"] = toggled["filename"]
+            info["enabled"] = False
+    except MinecraftError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+    if info["filename"] != old_filename:
+        try:
+            minecraft_delete_content(root, software_id, old_filename)
+        except MinecraftError:
+            pass
+        with db() as conn:
+            conn.execute(
+                "DELETE FROM plugin_installs WHERE server_id = ? AND filename = ?",
+                (server_id, old_filename),
+            )
+    _record_plugin(server_id, info)
+    log_activity(
+        user["id"],
+        server_id,
+        "minecraft:content-update",
+        {
+            "project": info.get("project_id"),
+            "title": info.get("title"),
+            "from": item.get("version_number"),
+            "to": info.get("version_number"),
+        },
+    )
+    instance = manager.instances.get(server_id)
+    running = bool(instance and instance.proc and instance.proc.returncode is None)
+    return {"data": info, "updated": True, "restart_required": running}
 
 
 @app.post("/api/servers/{server_id}/plugins/upload")
@@ -2635,7 +3260,11 @@ def create_backup_file(server: dict[str, Any], name: str | None = None) -> dict[
     with tarfile.open(dest, "w:gz") as tar:
         if src.exists():
             tar.add(src, arcname=".")
-    checksum = hashlib.sha256(dest.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with dest.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    checksum = digest.hexdigest()
     label = name or time.strftime("backup-%Y%m%d-%H%M%S", time.gmtime())
     with db() as conn:
         conn.execute(
@@ -2732,11 +3361,31 @@ def create_schedule(
     server_id: str, body: ScheduleBody, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, Any]:
     get_server(server_id, user)
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(400, "Schedule name is required")
+    if body.action not in ("start", "stop", "restart", "kill", "backup", "command"):
+        raise HTTPException(400, "Unsupported schedule action")
+    if body.action == "command" and not body.payload.strip():
+        raise HTTPException(400, "A console command is required for this action")
+    expr = body.cron.strip() or "*/5 * * * *"
+    if len(expr.split()) != 5:
+        raise HTTPException(400, "Cron expressions must contain five fields")
+    next_run = schedule_next_run(expr)
     with db() as conn:
         cur = conn.execute(
-            """INSERT INTO schedules (server_id, name, cron, action, payload, enabled, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (server_id, body.name, body.cron, body.action, body.payload, 1 if body.enabled else 0, utcnow()),
+            """INSERT INTO schedules (server_id, name, cron, action, payload, enabled, next_run, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                server_id,
+                name,
+                expr,
+                body.action,
+                body.payload.strip(),
+                1 if body.enabled else 0,
+                next_run,
+                utcnow(),
+            ),
         )
         row = conn.execute("SELECT * FROM schedules WHERE id = ?", (cur.lastrowid,)).fetchone()
     return {"data": row_to_dict(row)}
@@ -2756,9 +3405,10 @@ def update_schedule(
         ).fetchone()
         if not row:
             raise HTTPException(404, "Schedule not found")
+        next_run = schedule_next_run(str(row["cron"])) if body.enabled else None
         conn.execute(
-            "UPDATE schedules SET enabled = ? WHERE id = ? AND server_id = ?",
-            (1 if body.enabled else 0, schedule_id, server_id),
+            "UPDATE schedules SET enabled = ?, next_run = ? WHERE id = ? AND server_id = ?",
+            (1 if body.enabled else 0, next_run, schedule_id, server_id),
         )
         out = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
     return {"data": row_to_dict(out)}
@@ -2779,7 +3429,10 @@ async def run_schedule_now(
         raise HTTPException(404, "Schedule not found")
     await execute_schedule_action(server, schedule)
     with db() as conn:
-        conn.execute("UPDATE schedules SET last_run = ? WHERE id = ?", (utcnow(), schedule_id))
+        conn.execute(
+            "UPDATE schedules SET last_run = ?, next_run = ? WHERE id = ?",
+            (utcnow(), schedule_next_run(str(schedule.get("cron") or "*/5 * * * *")), schedule_id),
+        )
     log_activity(user["id"], server_id, "schedule:run", {"name": schedule["name"]})
     return {"status": "ok"}
 
@@ -2948,6 +3601,308 @@ def ws_user(token: str | None) -> dict[str, Any]:
     if not user:
         raise HTTPException(401, "Invalid token")
     return user
+
+
+@app.websocket("/ws/terminal/{server_id}")
+async def ws_terminal(websocket: WebSocket, server_id: str, token: str = Query("")) -> None:
+    await websocket.accept()
+    try:
+        user = ws_user(token)
+        server = get_server(server_id, user)
+        reject_suspended(server)
+        require_terminal(server, user)
+    except HTTPException as exc:
+        await websocket.send_json({"event": "error", "message": exc.detail})
+        await websocket.close()
+        return
+
+    root = terminal_root(server_id)
+    shell_env = terminal_environment(root, server_id, str(server.get("name") or "server"))
+    session: dict[str, Any] = {
+        "cwd": root,
+        "previous": root,
+        "proc": None,
+        "task": None,
+    }
+    send_lock = asyncio.Lock()
+
+    async def send(payload: dict[str, Any]) -> None:
+        async with send_lock:
+            await websocket.send_json(payload)
+
+    def sudo_enabled() -> bool:
+        with db() as conn:
+            row = conn.execute(
+                "SELECT terminal_sudo FROM servers WHERE id = ?", (server_id,)
+            ).fetchone()
+        return bool(row["terminal_sudo"]) if row else False
+
+    async def async_send(payload: dict[str, Any]) -> None:
+        try:
+            await send(payload)
+        except (WebSocketDisconnect, RuntimeError, OSError):
+            pass
+
+    async def finish_command(command: str, use_sudo: bool, code: int, duration_ms: int) -> None:
+        await async_send(
+            {
+                "event": "terminal exit",
+                "code": code,
+                "cwd": terminal_relative(session["cwd"], root),
+                "duration_ms": duration_ms,
+                "sudo": use_sudo,
+                "timed_out": bool(session.pop("timed_out", False)),
+                "truncated": bool(session.pop("truncated", False)),
+            }
+        )
+        if command:
+            log_activity(
+                user["id"],
+                server_id,
+                "server:terminal",
+                {
+                    "command": command[:180],
+                    "exit": code,
+                    "sudo": use_sudo,
+                    "duration_ms": duration_ms,
+                },
+            )
+
+    async def run_command(command: str, use_sudo: bool) -> None:
+        started = time.monotonic()
+        if os.name == "nt":
+            argv = [
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                command,
+            ]
+        elif use_sudo:
+            argv = ["sudo", "-n", "--", "bash", "-c", command]
+        else:
+            argv = ["bash", "-c", command]
+        proc: asyncio.subprocess.Process | None = None
+        guard: asyncio.Task[Any] | None = None
+        code = 1
+        session.pop("timed_out", None)
+        session.pop("truncated", None)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(session["cwd"]),
+                env=shell_env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=os.name != "nt",
+            )
+            session["proc"] = proc
+            assert proc.stdout is not None
+
+            async def timeout_guard() -> None:
+                await asyncio.sleep(TERMINAL_TIMEOUT)
+                if proc.returncode is not None:
+                    return
+                session["timed_out"] = True
+                await async_send(
+                    {
+                        "event": "terminal output",
+                        "data": (
+                            f"\r\n\x1b[33m[vitestl] Command timed out after "
+                            f"{TERMINAL_TIMEOUT} seconds.\x1b[0m\r\n"
+                        ),
+                    }
+                )
+                await terminate_terminal_process(proc)
+
+            guard = asyncio.create_task(timeout_guard())
+            total = 0
+            while True:
+                chunk = await proc.stdout.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total <= TERMINAL_OUTPUT_LIMIT:
+                    await async_send(
+                        {
+                            "event": "terminal output",
+                            "data": chunk.decode("utf-8", errors="replace"),
+                        }
+                    )
+                elif not session.get("truncated"):
+                    session["truncated"] = True
+                    await async_send(
+                        {
+                            "event": "terminal output",
+                            "data": (
+                                "\r\n\x1b[33m[vitestl] Output limit reached. "
+                                "The command was stopped.\x1b[0m\r\n"
+                            ),
+                        }
+                    )
+                    await terminate_terminal_process(proc)
+            try:
+                code = await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                await terminate_terminal_process(proc)
+                code = await proc.wait()
+            if session.get("timed_out"):
+                code = 124
+        except FileNotFoundError:
+            code = 127
+            await async_send(
+                {
+                    "event": "terminal output",
+                    "data": f"\r\n\x1b[31m[vitestl] Shell not found: {argv[0]}\x1b[0m\r\n",
+                }
+            )
+        except Exception as exc:
+            code = 1
+            await async_send(
+                {
+                    "event": "terminal output",
+                    "data": f"\r\n\x1b[31m[vitestl] {str(exc)[:300]}\x1b[0m\r\n",
+                }
+            )
+        finally:
+            if guard:
+                guard.cancel()
+                try:
+                    await guard
+                except asyncio.CancelledError:
+                    pass
+            if proc and proc.returncode is None:
+                await terminate_terminal_process(proc)
+            session["proc"] = None
+            session["task"] = None
+            await finish_command(
+                command, use_sudo, int(code), int((time.monotonic() - started) * 1000)
+            )
+
+    await async_send(
+        {
+            "event": "terminal ready",
+            "data": terminal_payload(server, user),
+        }
+    )
+    log_activity(user["id"], server_id, "server:terminal-open", {})
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                await async_send({"event": "terminal error", "message": "Malformed terminal frame"})
+                continue
+            event = str(payload.get("event") or "")
+            if event == "exec":
+                task = session.get("task")
+                if task and not task.done():
+                    await async_send(
+                        {
+                            "event": "terminal error",
+                            "message": "Wait for the running command to finish or cancel it",
+                        }
+                    )
+                    continue
+                command = str(payload.get("command") or "").strip()
+                if not command:
+                    continue
+                if len(command) > TERMINAL_COMMAND_LIMIT:
+                    await async_send(
+                        {
+                            "event": "terminal error",
+                            "message": f"Commands are limited to {TERMINAL_COMMAND_LIMIT} characters",
+                        }
+                    )
+                    continue
+                if command in ("exit", "logout"):
+                    await async_send(
+                        {
+                            "event": "terminal output",
+                            "data": "[vitestl] This terminal belongs to the panel session. "
+                            "Use the power controls or close the tab.\r\n",
+                        }
+                    )
+                    await finish_command(command, False, 0, 0)
+                    continue
+                cd_match = TERMINAL_CD_RE.match(command)
+                if cd_match:
+                    started = time.monotonic()
+                    argument = (cd_match.group(1) or "").strip()
+                    if argument == "-":
+                        target = session["previous"]
+                        if not target.is_dir():
+                            target = root
+                    else:
+                        try:
+                            target = terminal_resolve_directory(
+                                root, session["cwd"], argument
+                            )
+                        except ValueError as exc:
+                            await async_send(
+                                {
+                                    "event": "terminal output",
+                                    "data": f"cd: {argument or '~'}: {exc}\r\n",
+                                }
+                            )
+                            await async_send(
+                                {
+                                    "event": "terminal exit",
+                                    "code": 1,
+                                    "cwd": terminal_relative(session["cwd"], root),
+                                    "duration_ms": int((time.monotonic() - started) * 1000),
+                                    "sudo": False,
+                                }
+                            )
+                            continue
+                    session["previous"] = session["cwd"]
+                    session["cwd"] = target
+                    if argument == "-":
+                        await async_send(
+                            {
+                                "event": "terminal output",
+                                "data": terminal_relative(target, root) + "\r\n",
+                            }
+                        )
+                    await async_send(
+                        {
+                            "event": "terminal exit",
+                            "code": 0,
+                            "cwd": terminal_relative(target, root),
+                            "duration_ms": int((time.monotonic() - started) * 1000),
+                            "sudo": False,
+                        }
+                    )
+                    continue
+                session["task"] = asyncio.create_task(
+                    run_command(command, sudo_enabled())
+                )
+            elif event == "cancel":
+                proc = session.get("proc")
+                if proc and proc.returncode is None:
+                    await async_send(
+                        {
+                            "event": "terminal output",
+                            "data": "\r\n\x1b[38;5;244m[vitestl] Cancelling command...\x1b[0m\r\n",
+                        }
+                    )
+                    await terminate_terminal_process(proc)
+            else:
+                await async_send(
+                    {"event": "terminal error", "message": f"Unknown terminal event: {event}"}
+                )
+    except WebSocketDisconnect:
+        pass
+    finally:
+        task = session.get("task")
+        if task and not task.done():
+            task.cancel()
+        proc = session.get("proc")
+        if proc and proc.returncode is None:
+            await terminate_terminal_process(proc)
 
 
 @app.websocket("/ws/console/{server_id}")
@@ -3280,8 +4235,20 @@ def admin_delete_user(user_id: int, admin: dict[str, Any] = Depends(admin_user))
 @app.get("/api/admin/nests")
 def admin_nests(_: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
     with db() as conn:
+        health = catalog_health(conn)
+        repaired = False
+        if health["missing"]:
+            sync_catalog(conn)
+            repaired = True
+            health = catalog_health(conn)
         nests = rows_to_list(conn.execute("SELECT * FROM nests ORDER BY id").fetchall())
         eggs = rows_to_list(conn.execute("SELECT * FROM eggs ORDER BY id").fetchall())
+        deployments = {
+            int(row["egg_id"]): int(row["total"] or 0)
+            for row in conn.execute(
+                "SELECT egg_id, COUNT(*) AS total FROM servers GROUP BY egg_id"
+            ).fetchall()
+        }
     for e in eggs:
         try:
             e["variables"] = json.loads(e.get("variables") or "[]")
@@ -3289,10 +4256,17 @@ def admin_nests(_: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
             e["variables"] = []
         e.pop("files", None)
         e["custom"] = int(e.get("id") or 0) >= 1000
+        e["deployments"] = deployments.get(int(e["id"]), 0)
+        e["installed"] = e["deployments"] > 0
     return {
         "nests": nests,
         "eggs": eggs,
         "catalog": {"nests": len(NESTS), "eggs": len(EGGS), "version": PANEL_VERSION},
+        "catalog_health": {
+            **health,
+            "repaired": repaired,
+            "known_egg_ids": builtin_egg_ids(),
+        },
     }
 
 
@@ -3359,7 +4333,7 @@ def admin_create_egg(body: EggBody, admin: dict[str, Any] = Depends(admin_user))
 
 @app.get("/api/admin/eggs/{egg_id}")
 def admin_egg_detail(egg_id: int, _: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
-    egg = load_egg(egg_id)
+    egg = resolve_egg(egg_id)
     if not egg:
         raise HTTPException(404, "Egg not found")
     return {"data": egg}
@@ -3768,9 +4742,16 @@ async def admin_create_server(
                 "MOTD": str(mc_config["properties"].get("motd") or ""),
             }
         )
-    egg = load_egg(body.egg_id)
+    egg = resolve_egg(body.egg_id)
     if not egg:
-        raise HTTPException(400, "Unknown egg")
+        known = ", ".join(str(item) for item in builtin_egg_ids())
+        raise HTTPException(
+            400,
+            f"Unknown egg {body.egg_id}. The built-in catalogue could not be "
+            f"loaded. Run Administration -> Nests -> Sync catalogue, verify the "
+            f"backend was deployed and restarted, then try again. Built-in egg "
+            f"IDs: {known}.",
+        )
     name = body.name.strip()
     if not name:
         raise HTTPException(400, "Server name is required")

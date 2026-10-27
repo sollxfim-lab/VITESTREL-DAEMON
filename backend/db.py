@@ -109,7 +109,8 @@ def init_db() -> None:
                 environment TEXT NOT NULL DEFAULT '{}',
                 status TEXT NOT NULL DEFAULT 'offline',
                 created_at TEXT NOT NULL,
-                installed INTEGER NOT NULL DEFAULT 1
+                installed INTEGER NOT NULL DEFAULT 1,
+                terminal_sudo INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS databases (
@@ -290,6 +291,8 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     _add_column(conn, "servers", "mc_message", "mc_message TEXT NOT NULL DEFAULT ''")
     _add_column(conn, "servers", "mc_installed_at", "mc_installed_at TEXT")
     _add_column(conn, "servers", "mc_eula", "mc_eula INTEGER NOT NULL DEFAULT 0")
+    _add_column(conn, "servers", "terminal_sudo", "terminal_sudo INTEGER NOT NULL DEFAULT 0")
+    _add_column(conn, "schedules", "next_run", "next_run TEXT")
     _add_column(conn, "allocations", "node_id", "node_id INTEGER NOT NULL DEFAULT 1")
     conn.execute(
         """

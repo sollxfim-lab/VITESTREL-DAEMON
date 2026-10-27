@@ -1,8 +1,8 @@
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { useOutletContext } from "react-router-dom";
 import { User, api, fmtDate, timeAgo } from "../api";
 import { Icon } from "../icons";
-import { CopyButton, PageHeader, notify } from "../ui";
+import { ConfirmButton, CopyButton, PageHeader, notify } from "../ui";
 
 function passwordStrength(value: string): { score: number; label: string; tone: string } {
   let score = 0;
@@ -32,6 +32,36 @@ export default function Account() {
   const strength = useMemo(() => passwordStrength(passwordForm.next), [passwordForm.next]);
   const initials = (user.first_name?.[0] || user.username.slice(0, 1)).toUpperCase();
   const displayName = [user.first_name, user.last_name].filter(Boolean).join(" ") || user.username;
+  const [keys, setKeys] = useState<any[]>([]);
+  const [keyName, setKeyName] = useState("Panel API");
+  const [keyBusy, setKeyBusy] = useState(false);
+  const [freshToken, setFreshToken] = useState("");
+
+  const loadKeys = useCallback(async () => {
+    try {
+      setKeys((await api.apiKeys()).data);
+    } catch (err: any) {
+      notify(err.message || "Unable to load API keys", "error");
+    }
+  }, []);
+
+  useEffect(() => { loadKeys(); }, [loadKeys]);
+
+  async function createKey(event: FormEvent) {
+    event.preventDefault();
+    setKeyBusy(true);
+    try {
+      const response = await api.createApiKey(keyName.trim() || "Panel API");
+      setFreshToken(response.data.token);
+      setKeyName("Panel API");
+      notify("API key created");
+      await loadKeys();
+    } catch (err: any) {
+      notify(err.message || "Unable to create API key", "error");
+    } finally {
+      setKeyBusy(false);
+    }
+  }
 
   async function saveProfile(event: FormEvent) {
     event.preventDefault();
@@ -74,7 +104,7 @@ export default function Account() {
       <PageHeader
         eyebrow="Account"
         title="Personal settings"
-        description="Manage the identity attached to your panel session and rotate your password."
+        description="Manage the identity attached to your panel session, rotate your password, and issue API keys."
       />
 
       <div className="account-hero">
@@ -188,6 +218,74 @@ export default function Account() {
           </div>
         </aside>
       </div>
+
+      <section className="card account-keys">
+        <div className="card-head">
+          <div>
+            <h2>API keys</h2>
+            <p>Bearer tokens for automation. The secret is shown once at creation. Prefix <code>vt_</code>.</p>
+          </div>
+          <span className="card-head-icon"><Icon name="key" /></span>
+        </div>
+        <div className="card-body">
+          <form className="api-key-form" onSubmit={createKey}>
+            <div className="field">
+              <label>Key name</label>
+              <input value={keyName} onChange={(event) => setKeyName(event.target.value)} placeholder="CI deploy" maxLength={80} />
+            </div>
+            <button className="btn btn-primary" disabled={keyBusy}>
+              <Icon name={keyBusy ? "circle-notch" : "plus"} className={keyBusy ? "spin" : ""} /> Create key
+            </button>
+          </form>
+          {freshToken && (
+            <div className="api-key-once">
+              <div>
+                <strong>Copy this token now</strong>
+                <span>It will not be shown again.</span>
+              </div>
+              <CopyButton value={freshToken} label="Copy token" className="btn btn-ghost btn-sm" />
+              <code>{freshToken}</code>
+            </div>
+          )}
+          {keys.length === 0 ? (
+            <p className="muted">No API keys yet. Created keys authenticate as your account against /api.</p>
+          ) : (
+            <div className="table-wrap">
+              <table className="table">
+                <thead><tr><th>Name</th><th>Prefix</th><th>Last used</th><th>Created</th><th /></tr></thead>
+                <tbody>
+                  {keys.map((key) => (
+                    <tr key={key.id}>
+                      <td>{key.name}</td>
+                      <td><code>{key.prefix}</code></td>
+                      <td>{key.last_used ? timeAgo(key.last_used) : "Never"}</td>
+                      <td>{fmtDate(key.created_at)}</td>
+                      <td>
+                        <ConfirmButton
+                          className="btn btn-ghost btn-sm"
+                          icon="trash"
+                          title={`Revoke ${key.name}?`}
+                          description="Scripts using this token will fail immediately."
+                          confirmLabel="Revoke key"
+                          tone="danger"
+                          onConfirm={async () => {
+                            await api.deleteApiKey(key.id);
+                            if (freshToken.startsWith(String(key.prefix || "").replace("...", ""))) setFreshToken("");
+                            notify("API key revoked");
+                            await loadKeys();
+                          }}
+                        >
+                          Revoke
+                        </ConfirmButton>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </section>
     </div>
   );
 }

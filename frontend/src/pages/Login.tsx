@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useState } from "react";
 import { api, setToken, type Meta } from "../api";
-import { BrandMark, Icon } from "../icons";
-import authFabric from "../assets/auth-fabric.svg";
+import { AuthEmblem, BrandMark, Icon } from "../icons";
+import minecraftHero from "../assets/minecraft-hero.svg";
 
 const capabilities = [
   {
@@ -122,7 +122,7 @@ export default function Login() {
               </div>
               <img
                 className="auth-preview-art"
-                src={authFabric}
+                src={minecraftHero}
                 alt=""
                 aria-hidden="true"
               />
@@ -143,9 +143,12 @@ export default function Login() {
 
       <section className="auth-panel">
         <div className="auth-card">
-          <div className="auth-card-brand">
-            <BrandMark />
-            <span>{meta?.name || "VITESTERTL"}</span>
+          <div className="auth-emblem">
+            <AuthEmblem />
+            <div className="auth-emblem-copy">
+              <strong>{meta?.name || "VITESTERTL"}</strong>
+              <span>Game and application control plane</span>
+            </div>
           </div>
           <div className="auth-card-head">
             <span className="eyebrow">Secure access</span>

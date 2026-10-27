@@ -48,6 +48,246 @@ export type Server = {
   created_at: string;
   allocation_port: number;
   allocation_ip: string;
+  tags?: string[];
+  mc_software?: string;
+  mc_version?: string;
+  mc_loader_version?: string;
+  mc_status?: string;
+  mc_message?: string;
+  mc_installed_at?: string | null;
+  mc_eula?: number;
+  terminal_sudo?: number;
+};
+
+export type MinecraftSoftware = {
+  id: string;
+  name: string;
+  edition: "java" | "bedrock";
+  kind: "server" | "proxy" | "bedrock";
+  description: string;
+  accent: string;
+  icon: string;
+  content: "plugin" | "mod" | null;
+  content_dir: string;
+  loaders: string[];
+  proxy: boolean;
+  requires_eula: boolean;
+  egg_id: number;
+  source: string;
+};
+
+export type MinecraftVersion = {
+  id: string;
+  type: string;
+  released?: string | null;
+  channel?: string;
+  download_url?: string;
+};
+
+export type MinecraftLoader = {
+  id: string;
+  label: string;
+  stable: boolean;
+  channel?: string;
+  time?: string;
+};
+
+export type MinecraftCatalog = {
+  software: MinecraftSoftware;
+  versions: MinecraftVersion[];
+  loaders: MinecraftLoader[];
+  defaults: { version: string; loader_version: string };
+  notes: string[];
+  fetched_at: string;
+};
+
+export type MinecraftJob = {
+  id: string;
+  server_id: string;
+  status: string;
+  progress: number;
+  message: string;
+  software?: string;
+  software_name?: string;
+  version?: string;
+  loader_version?: string;
+  logs: string[];
+  created_at?: string;
+  updated_at?: string;
+  result?: Record<string, any>;
+};
+
+export type MinecraftInstallSelection = {
+  software: string;
+  version: string;
+  loader_version: string;
+  accept_eula: boolean;
+  properties: Record<string, string>;
+};
+
+export type MinecraftInfo = {
+  available: boolean;
+  software: MinecraftSoftware | null;
+  version?: string;
+  loader_version?: string;
+  status?: string;
+  message?: string;
+  installed_at?: string | null;
+  eula?: boolean;
+  capabilities: {
+    enabled: boolean;
+    kind: "plugin" | "mod" | null;
+    directory: string;
+    loaders: string[];
+    project_type?: string;
+    edition?: string;
+  };
+  properties: Record<string, string>;
+  job: MinecraftJob | null;
+  manifest?: Record<string, any>;
+};
+
+export type MinecraftUpdateInfo = {
+  current: {
+    software: string;
+    version: string;
+    loader_version: string;
+  };
+  latest: {
+    software: string;
+    software_name: string;
+    edition: "java" | "bedrock";
+    version: string;
+    loader_version: string;
+    released?: string | null;
+    type: string;
+    notes: string[];
+    fetched_at: string;
+  };
+  update_available: boolean;
+  version_update: boolean;
+  loader_update: boolean;
+  floating_channel: boolean;
+};
+
+export type MinecraftContentUpdate = {
+  filename: string;
+  base_name: string;
+  title: string;
+  project_id: string;
+  project_slug: string;
+  icon_url: string;
+  current_version_id: string;
+  current_version: string;
+  latest: MinecraftContentVersion;
+  enabled: boolean;
+};
+
+export type CatalogHealth = {
+  expected: number;
+  installed: number;
+  missing: number[];
+  repaired?: boolean;
+  known_egg_ids?: number[];
+};
+
+export type TerminalInfo = {
+  user: string;
+  server: string;
+  cwd: string;
+  root: string;
+  sudo: boolean;
+  can_toggle_sudo: boolean;
+  sudo_available: boolean;
+  shell: string;
+  platform: string;
+  timeout_seconds: number;
+};
+
+export type EggCatalogEntry = {
+  id: number;
+  nest_id: number;
+  name: string;
+  description: string;
+  runtime: string;
+  docker_image: string;
+  startup: string;
+  variables: Array<{ env: string; name: string; default?: string; rules?: string }>;
+  custom?: boolean;
+  deployments?: number;
+  installed?: boolean;
+};
+
+export type MinecraftContent = {
+  filename: string;
+  base_name: string;
+  enabled: boolean;
+  size: number;
+  modified_at?: string | null;
+  directory: string;
+  project_type: "plugin" | "mod";
+  title: string;
+  project_id: string;
+  project_slug: string;
+  version_id: string;
+  version_number: string;
+  icon_url: string;
+  source: string;
+  installed_at?: string | null;
+  tracked: boolean;
+};
+
+export type MinecraftContentProject = {
+  id: string;
+  slug: string;
+  title: string;
+  description: string;
+  author: string;
+  icon_url: string;
+  downloads: number;
+  follows: number;
+  categories: string[];
+  loaders: string[];
+  game_versions: string[];
+  project_type: "plugin" | "mod";
+  client_side: string;
+  server_side: string;
+  url: string;
+  updated?: string | null;
+};
+
+export type MinecraftContentSearch = {
+  data: MinecraftContentProject[];
+  total: number;
+  featured: boolean;
+  project_type: "plugin" | "mod";
+  loaders: string[];
+  source: string;
+};
+
+export type MinecraftContentVersion = {
+  id: string;
+  name: string;
+  version_number: string;
+  game_versions: string[];
+  loaders: string[];
+  date_published?: string | null;
+  files: Array<{ filename: string; primary: boolean; size: number }>;
+};
+
+export type MinecraftStatus = {
+  online: boolean;
+  latency_ms: number;
+  error?: string;
+  motd?: string;
+  version?: string;
+  protocol?: number;
+  players?: {
+    online: number;
+    max: number;
+    sample: Array<{ name: string; id: string }>;
+  };
+  icon?: string;
 };
 
 export type Activity = {
@@ -231,6 +471,15 @@ export const api = {
   deleteUser: (id: string, uid: number) => req(`/api/servers/${id}/users/${uid}`, { method: "DELETE" }),
   serverActivity: (id: string) => req<{ data: Activity[] }>(`/api/servers/${id}/activity`),
   updateAccount: (body: any) => req<{ user: User }>("/api/account", { method: "PUT", body: JSON.stringify(body) }),
+  apiKeys: () => req<{ data: any[] }>("/api/account/api-keys"),
+  createApiKey: (name: string) =>
+    req<{ data: any }>("/api/account/api-keys", { method: "POST", body: JSON.stringify({ name }) }),
+  deleteApiKey: (id: number) => req(`/api/account/api-keys/${id}`, { method: "DELETE" }),
+  saveTags: (id: string, tags: string[]) =>
+    req<{ data: { tags: string[] } }>(`/api/servers/${id}/tags`, {
+      method: "PUT",
+      body: JSON.stringify({ tags }),
+    }),
   adminOverview: () => req<{ data: any }>("/api/admin/overview"),
   adminActivity: (limit = 50, offset = 0, event = "") => {
     const q = new URLSearchParams({ limit: String(limit), offset: String(offset) });
@@ -246,7 +495,19 @@ export const api = {
   adminUpdateUser: (id: number, body: any) =>
     req(`/api/admin/users/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   adminDeleteUser: (id: number) => req(`/api/admin/users/${id}`, { method: "DELETE" }),
-  adminNests: () => req<{ nests: any[]; eggs: any[] }>("/api/admin/nests"),
+  adminNests: () =>
+    req<{
+      nests: any[];
+      eggs: EggCatalogEntry[];
+      catalog?: { nests: number; eggs: number; version: string };
+      catalog_health?: CatalogHealth;
+    }>("/api/admin/nests"),
+  adminSyncNests: () => req<{ status: string; nests: number; eggs: number }>("/api/admin/nests/sync", { method: "POST" }),
+  adminCreateNest: (body: any) =>
+    req<{ data: any }>("/api/admin/nests", { method: "POST", body: JSON.stringify(body) }),
+  adminCreateEgg: (body: any) =>
+    req<{ data: any }>("/api/admin/eggs", { method: "POST", body: JSON.stringify(body) }),
+  adminEgg: (id: number) => req<{ data: any }>(`/api/admin/eggs/${id}`),
   adminNodes: () => req<{ data: any[] }>("/api/admin/nodes"),
   adminNodeAudit: () => req<{ data: any }>("/api/admin/node-installer/audit"),
   adminAutoInstallNode: (body: any) =>
@@ -308,6 +569,102 @@ export const api = {
     }),
   password: (current: string, new_password: string) =>
     req("/api/auth/password", { method: "POST", body: JSON.stringify({ current, new_password }) }),
+  terminalInfo: (id: string) =>
+    req<{ data: TerminalInfo }>(`/api/servers/${id}/terminal`),
+  setTerminalSudo: (id: string, enabled: boolean) =>
+    req<{ data: TerminalInfo }>(`/api/servers/${id}/terminal/sudo`, {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    }),
+  minecraftCatalog: () => req<{ data: MinecraftSoftware[] }>("/api/minecraft/catalog"),
+  minecraftVersions: (software: string, version = "", includeSnapshots = false) => {
+    const q = new URLSearchParams();
+    if (version) q.set("version", version);
+    if (includeSnapshots) q.set("include_snapshots", "true");
+    const suffix = q.toString();
+    return req<{ data: MinecraftCatalog }>(
+      `/api/minecraft/catalog/${encodeURIComponent(software)}/versions${suffix ? `?${suffix}` : ""}`
+    );
+  },
+  minecraftInfo: (id: string) => req<{ data: MinecraftInfo }>(`/api/servers/${id}/minecraft`),
+  minecraftStatus: (id: string) =>
+    req<{ data: MinecraftStatus }>(`/api/servers/${id}/minecraft/status`),
+  minecraftInstall: (id: string, body: MinecraftInstallSelection) =>
+    req<{ data: MinecraftJob }>(`/api/servers/${id}/minecraft/install`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  minecraftJob: (id: string, jobId: string) =>
+    req<{ data: MinecraftJob }>(`/api/servers/${id}/minecraft/jobs/${encodeURIComponent(jobId)}`),
+  minecraftUpdate: (id: string) =>
+    req<{ data: MinecraftUpdateInfo }>(`/api/servers/${id}/minecraft/update`),
+  minecraftUpgrade: (
+    id: string,
+    body: { version?: string; loader_version?: string | null; accept_eula?: boolean; backup?: boolean }
+  ) =>
+    req<{ data: MinecraftJob; backup: any | null }>(`/api/servers/${id}/minecraft/upgrade`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  minecraftProperties: (id: string, properties: Record<string, string>) =>
+    req<{ data: Record<string, string> }>(`/api/servers/${id}/minecraft/properties`, {
+      method: "PUT",
+      body: JSON.stringify({ properties }),
+    }),
+  plugins: (id: string) =>
+    req<{
+      data: MinecraftContent[];
+      capabilities: MinecraftInfo["capabilities"];
+      counts: { total: number; enabled: number };
+    }>(`/api/servers/${id}/plugins`),
+  pluginSearch: (id: string, query = "", featured = false, limit = 20, offset = 0) => {
+    const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    if (query) params.set("query", query);
+    if (featured) params.set("featured", "true");
+    return req<MinecraftContentSearch>(`/api/servers/${id}/plugins/search?${params.toString()}`);
+  },
+  pluginVersions: (id: string, projectId: string, limit = 16) =>
+    req<{
+      data: MinecraftContentVersion[];
+      project_type: "plugin" | "mod";
+      loaders: string[];
+    }>(
+      `/api/servers/${id}/plugins/versions/${encodeURIComponent(projectId)}?limit=${limit}`
+    ),
+  pluginUpdates: (id: string) =>
+    req<{
+      data: MinecraftContentUpdate[];
+      checked: number;
+      errors: Array<{ filename: string; title: string; project_id: string; error: string }>;
+      project_type?: "plugin" | "mod";
+    }>(`/api/servers/${id}/plugins/updates`),
+  pluginUpdate: (id: string, filename: string, versionId = "") =>
+    req<{ data: MinecraftContent; updated: boolean; restart_required?: boolean; message?: string }>(
+      `/api/servers/${id}/plugins/${encodeURIComponent(filename)}/update`,
+      { method: "POST", body: JSON.stringify({ version_id: versionId || null }) }
+    ),
+  pluginInstall: (id: string, projectId: string, versionId = "") =>
+    req<{ data: MinecraftContent }>(`/api/servers/${id}/plugins`, {
+      method: "POST",
+      body: JSON.stringify({ project_id: projectId, version_id: versionId || null }),
+    }),
+  pluginUpload: async (id: string, file: File) => {
+    const fd = new FormData();
+    fd.append("upload", file);
+    return req<{ data: MinecraftContent }>(`/api/servers/${id}/plugins/upload`, {
+      method: "POST",
+      body: fd,
+    });
+  },
+  pluginToggle: (id: string, filename: string) =>
+    req<{ data: { filename: string; enabled: boolean } }>(
+      `/api/servers/${id}/plugins/${encodeURIComponent(filename)}/toggle`,
+      { method: "POST" }
+    ),
+  pluginDelete: (id: string, filename: string) =>
+    req<{ status: string }>(`/api/servers/${id}/plugins/${encodeURIComponent(filename)}`, {
+      method: "DELETE",
+    }),
 };
 
 export function fmtBytes(n: number): string {

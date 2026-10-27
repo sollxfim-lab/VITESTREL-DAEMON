@@ -38,6 +38,11 @@ function eggIcon(nest: string): string {
   if (value.includes("node")) return "node-js";
   if (value.includes("java")) return "java";
   if (value.includes("docker")) return "docker";
+  if (value.includes("minecraft")) return "cube";
+  if (value.includes("voice")) return "microphone";
+  if (value.includes("database")) return "database";
+  if (value.includes("bot")) return "robot";
+  if (value.includes("system")) return "gears";
   return "cube";
 }
 
@@ -105,7 +110,9 @@ export default function Dashboard() {
           server.name.toLowerCase().includes(needle) ||
           (server.description || "").toLowerCase().includes(needle) ||
           (server.egg_name || "").toLowerCase().includes(needle) ||
-          (server.owner_name || "").toLowerCase().includes(needle)
+          (server.nest_name || "").toLowerCase().includes(needle) ||
+          (server.owner_name || "").toLowerCase().includes(needle) ||
+          (server.tags || []).some((tag) => tag.toLowerCase().includes(needle))
         );
       })
       .sort((a, b) => {
@@ -320,7 +327,7 @@ export default function Dashboard() {
               <Icon name="magnifying-glass" />
               <input
                 type="search"
-                placeholder="Search workloads, eggs or owners"
+                placeholder="Search workloads, nests, eggs, tags or owners"
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
                 aria-label="Search workloads"
@@ -547,6 +554,13 @@ function ServerCard({
       </div>
 
       <p className="server-desc">{server.description || "No description provided."}</p>
+      {(server.tags || []).length > 0 && (
+        <div className="tag-row">
+          {(server.tags || []).map((tag) => (
+            <span className="tag-chip" key={tag}>{tag}</span>
+          ))}
+        </div>
+      )}
 
       <div className="server-address">
         <Icon name="globe" />

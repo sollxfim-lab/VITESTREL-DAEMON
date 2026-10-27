@@ -1,0 +1,156 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 280" fill="none" role="img" aria-label="Isometric Minecraft world with a glowing portal and floating blocks">
+  <defs>
+    <linearGradient id="mcGrassTop" x1="250" y1="92" x2="510" y2="210" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6fd383"/>
+      <stop offset=".55" stop-color="#4bb965"/>
+      <stop offset="1" stop-color="#329e55"/>
+    </linearGradient>
+    <linearGradient id="mcGrassSide" x1="380" y1="210" x2="380" y2="246" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3da65b"/>
+      <stop offset="1" stop-color="#277343"/>
+    </linearGradient>
+    <linearGradient id="mcDirt" x1="380" y1="230" x2="380" y2="300" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7b5336"/>
+      <stop offset="1" stop-color="#4a3020"/>
+    </linearGradient>
+    <linearGradient id="mcDirtDark" x1="380" y1="240" x2="380" y2="300" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5f3f2a"/>
+      <stop offset="1" stop-color="#332116"/>
+    </linearGradient>
+    <linearGradient id="mcStone" x1="380" y1="260" x2="380" y2="330" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#536779"/>
+      <stop offset="1" stop-color="#293744"/>
+    </linearGradient>
+    <linearGradient id="mcWater" x1="315" y1="120" x2="315" y2="250" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6ed7f7"/>
+      <stop offset=".55" stop-color="#38a8df"/>
+      <stop offset="1" stop-color="#1c6f9f" stop-opacity=".15"/>
+    </linearGradient>
+    <linearGradient id="mcPortal" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#d9b6ff"/>
+      <stop offset=".45" stop-color="#9b6cf0"/>
+      <stop offset="1" stop-color="#5a35b8"/>
+    </linearGradient>
+    <linearGradient id="mcBeam" x1="380" y1="24" x2="380" y2="180" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6ee7ff" stop-opacity=".62"/>
+      <stop offset="1" stop-color="#6ee7ff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="mcLeaves" x1="280" y1="70" x2="340" y2="150" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#77d98a"/>
+      <stop offset="1" stop-color="#2d8b4b"/>
+    </linearGradient>
+    <linearGradient id="mcTrunk" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#90623b"/>
+      <stop offset="1" stop-color="#543620"/>
+    </linearGradient>
+    <radialGradient id="mcHalo" cx="0" cy="0" r="1" gradientTransform="translate(380 154) rotate(90) scale(108 248)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#58c9f2" stop-opacity=".24"/>
+      <stop offset="1" stop-color="#58c9f2" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="mcPortalGlow" cx="0" cy="0" r="1" gradientTransform="translate(506 158) rotate(90) scale(80 58)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#b48aff" stop-opacity=".5"/>
+      <stop offset="1" stop-color="#b48aff" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="mcBlur" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="14"/>
+    </filter>
+    <filter id="mcBlurSoft" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="5"/>
+    </filter>
+    <pattern id="mcDots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="1" fill="#9db7cf" fill-opacity=".18"/>
+    </pattern>
+  </defs>
+
+  <rect width="760" height="280" fill="url(#mcDots)" opacity=".5"/>
+  <ellipse cx="380" cy="158" rx="250" ry="108" fill="url(#mcHalo)" filter="url(#mcBlur)"/>
+
+  <g opacity=".7">
+    <circle cx="114" cy="62" r="1.5" fill="#8ed7ff"/>
+    <circle cx="168" cy="112" r="1" fill="#8ed7ff"/>
+    <circle cx="635" cy="68" r="1.5" fill="#c7b3ff"/>
+    <circle cx="676" cy="132" r="1" fill="#8ed7ff"/>
+    <circle cx="592" cy="48" r="1" fill="#d7e8f7"/>
+    <circle cx="92" cy="190" r="1" fill="#7ee0b3"/>
+    <path d="M646 196l3 6 6 3-6 3-3 6-3-6-6-3 6-3 3-6Z" fill="#f0bd5c" fill-opacity=".7"/>
+    <path d="M136 142l2 4 4 2-4 2-2 4-2-4-4-2 4-2 2-4Z" fill="#8ed7ff" fill-opacity=".55"/>
+  </g>
+
+  <path d="M380 40v132" stroke="url(#mcBeam)" stroke-width="24" filter="url(#mcBlurSoft)" opacity=".8"/>
+  <path d="M380 56v108" stroke="#8eeaff" stroke-width="1" opacity=".4"/>
+
+  <g>
+    <path d="M380 96 508 160 380 224 252 160 380 96Z" fill="url(#mcGrassTop)"/>
+    <path d="M252 160 380 224v22L252 182v-22Z" fill="url(#mcGrassSide)"/>
+    <path d="M508 160 380 224v22l128-64v-22Z" fill="#2c8b4d"/>
+    <path d="M252 182 380 246v20L252 202v-20Z" fill="url(#mcDirt)"/>
+    <path d="M508 182 380 246v20l128-64v-20Z" fill="#543824"/>
+    <path d="M252 202 380 266v12L252 214v-12Z" fill="url(#mcStone)"/>
+    <path d="M508 202 380 266v12l128-64v-12Z" fill="#334352"/>
+
+    <path d="M266 165 312 188 266 211 220 188 266 165Z" fill="#5ac676" fill-opacity=".28"/>
+    <path d="M370 113 408 132 370 151 332 132 370 113Z" fill="#8be59c" fill-opacity=".22"/>
+    <path d="M432 184 472 204 432 224 392 204 432 184Z" fill="#2a7b46" fill-opacity=".55"/>
+
+    <path d="M300 144 322 155 300 166 278 155 300 144Z" fill="#a87b4e"/>
+    <path d="M278 155 300 166v12l-22-11v-12Z" fill="#7b5434"/>
+    <path d="M322 155 300 166v12l22-11v-12Z" fill="#5f4028"/>
+
+    <path d="M286 132h28v13h-28v-13Z" fill="url(#mcTrunk)"/>
+    <path d="M300 132h14v13h-14v-13Z" fill="#4a2f1d" opacity=".75"/>
+    <path d="M266 89 300 73l34 16-34 17-34-17Z" fill="#65d07f"/>
+    <path d="M266 89 300 106v18l-34-17V89Z" fill="#3a9e58"/>
+    <path d="M334 89 300 106v18l34-17V89Z" fill="#2a7744"/>
+    <path d="M282 71 310 58l28 13-28 14-28-14Z" fill="#83e195"/>
+    <path d="M282 71 310 85v15l-28-14V71Z" fill="#4dae68"/>
+    <path d="M338 71 310 85v15l28-14V71Z" fill="#317e4d"/>
+    <path d="M294 55 316 45l22 10-22 11-22-11Z" fill="#97eba7"/>
+    <path d="M294 55 316 66v11l-22-11V55Z" fill="#59bd75"/>
+    <path d="M338 55 316 66v11l22-11V55Z" fill="#3a8f59"/>
+
+    <path d="M310 164c4 10 4 24 0 38" stroke="#86e6fa" stroke-width="6" stroke-linecap="round" opacity=".55" filter="url(#mcBlurSoft)"/>
+  </g>
+
+  <g>
+    <path d="M490 186 520 201 490 216 460 201 490 186Z" fill="#4e7f95"/>
+    <path d="M460 201 490 216v24l-30-15v-24Z" fill="#315566"/>
+    <path d="M520 201 490 216v24l30-15v-24Z" fill="#203f4e"/>
+    <path d="M490 186 520 201 505 209 475 194 490 186Z" fill="#63a4b8" opacity=".5"/>
+
+    <path d="M506 128c17 0 31 14 31 31v46h-62v-46c0-17 14-31 31-31Z" fill="#120f24"/>
+    <path d="M506 137c13 0 23 10 23 23v38h-46v-38c0-13 10-23 23-23Z" fill="url(#mcPortal)"/>
+    <path d="M506 147c9 0 16 7 16 16v29h-32v-29c0-9 7-16 16-16Z" fill="#c4a4ff" opacity=".35"/>
+    <path d="M506 137v61" stroke="#e3ccff" stroke-width="1.3" opacity=".45"/>
+    <path d="M483 158c14-8 32-8 46 0" stroke="#e3ccff" stroke-width="1.2" opacity=".35"/>
+    <path d="M483 178c14 8 32 8 46 0" stroke="#6a3dc4" stroke-width="1.2" opacity=".5"/>
+    <rect x="466" y="194" width="80" height="10" rx="3" fill="#1b1433"/>
+    <path d="M482 194h48" stroke="#b58cff" stroke-width="2" opacity=".7"/>
+    <circle cx="506" cy="205" r="35" fill="url(#mcPortalGlow)"/>
+  </g>
+
+  <g>
+    <path d="M124 176 156 192 124 208 92 192 124 176Z" fill="#5ec27a"/>
+    <path d="M92 192 124 208v20l-32-16v-20Z" fill="#388f54"/>
+    <path d="M156 192 124 208v20l32-16v-20Z" fill="#276b41"/>
+    <path d="M198 104 218 114 198 124 178 114 198 104Z" fill="#d3c37d"/>
+    <path d="M178 114 198 124v11l-20-10v-11Z" fill="#9a8a52"/>
+    <path d="M218 114 198 124v11l20-10v-11Z" fill="#746638"/>
+    <path d="M614 144 636 155 614 166 592 155 614 144Z" fill="#6bd884"/>
+    <path d="M592 155 614 166v13l-22-11v-13Z" fill="#409e5b"/>
+    <path d="M636 155 614 166v13l22-11v-13Z" fill="#2c7545"/>
+    <path d="M656 76 670 83 656 90 642 83 656 76Z" fill="#9a7be1"/>
+    <path d="M642 83 656 90v8l-14-7v-8Z" fill="#6a4bb0"/>
+    <path d="M670 83 656 90v8l14-7v-8Z" fill="#4d3387"/>
+  </g>
+
+  <g fill="#f0bd5c">
+    <circle cx="230" cy="96" r="2"/>
+    <circle cx="560" cy="108" r="1.8"/>
+    <circle cx="544" cy="216" r="1.6"/>
+  </g>
+  <g stroke="#7aa6c0" stroke-width="1" stroke-linecap="round" opacity=".55">
+    <path d="M214 150h14M221 143v14"/>
+    <path d="M580 138h12M586 132v12"/>
+    <path d="M170 226h10M175 221v10"/>
+  </g>
+</svg>

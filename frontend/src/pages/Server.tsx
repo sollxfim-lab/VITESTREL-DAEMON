@@ -14,6 +14,7 @@ import {
   Activity,
   Server as Srv,
   Stats,
+  TerminalInfo,
   User,
   api,
   fmtBytes,
@@ -24,6 +25,7 @@ import {
   wsUrl,
 } from "../api";
 import { Icon } from "../icons";
+import { MinecraftPane, PluginsPane } from "../minecraft";
 import { ResourceLimits } from "../resources";
 import {
   activityInfo,
@@ -50,6 +52,25 @@ const TABS = [
   { id: "startup", label: "Startup", icon: "rocket" },
   { id: "settings", label: "Settings", icon: "sliders" },
   { id: "activity", label: "Activity", icon: "clock-rotate-left" },
+];
+
+const MINECRAFT_TABS = [
+  { id: "minecraft", label: "Minecraft", icon: "cube" },
+  { id: "plugins", label: "Content", icon: "puzzle-piece" },
+];
+
+const TERMINAL_TAB = { id: "terminal", label: "Terminal", icon: "square-terminal" };
+
+const CRON_PRESETS = [
+  { value: "*/5 * * * *", label: "Every 5 minutes" },
+  { value: "*/15 * * * *", label: "Every 15 minutes" },
+  { value: "*/30 * * * *", label: "Every 30 minutes" },
+  { value: "0 * * * *", label: "Every hour" },
+  { value: "0 */6 * * *", label: "Every 6 hours" },
+  { value: "0 */12 * * *", label: "Every 12 hours" },
+  { value: "0 4 * * *", label: "Daily at 04:00 UTC" },
+  { value: "0 4 * * 0", label: "Weekly on Sunday at 04:00 UTC" },
+  { value: "0 4 1 * *", label: "Monthly on the 1st at 04:00 UTC" },
 ];
 
 function joinPath(dir: string, name: string): string {
@@ -136,6 +157,13 @@ export default function ServerPage() {
   const state = server.suspended ? "suspended" : stats?.state || server.status;
   const online = state === "running";
   const admin = user.role === "admin";
+  const canTerminal = admin || Number(server.owner_id) === Number(user.id);
+  const isMinecraft = !!server.mc_software || server.egg_id === 27 || server.egg_id === 28;
+  const baseTabs = canTerminal ? [TABS[0], TERMINAL_TAB, ...TABS.slice(1)] : TABS;
+  const tabs = isMinecraft
+    ? [baseTabs[0], ...MINECRAFT_TABS, ...baseTabs.slice(1)]
+    : baseTabs;
+  const activeTab = tabs.some((item) => item.id === tab) ? tab : "console";
 
   return (
     <div className="page server-page">
@@ -146,7 +174,7 @@ export default function ServerPage() {
           </Link>
           <div className="server-title-row">
             <span className={`server-title-icon ${online ? "online" : ""}`}>
-              <Icon name="server" />
+              <Icon name={isMinecraft ? "cube" : "server"} />
             </span>
             <div>
               <div className="server-title">
@@ -257,11 +285,11 @@ export default function ServerPage() {
       </section>
 
       <nav className="tabs" aria-label="Server sections">
-        {TABS.map((item) => (
+        {tabs.map((item) => (
           <button
             key={item.id}
             type="button"
-            className={tab === item.id ? "active" : ""}
+            className={activeTab === item.id ? "active" : ""}
             onClick={() => setSearchParams({ tab: item.id })}
           >
             <Icon name={item.icon} />
@@ -270,15 +298,20 @@ export default function ServerPage() {
         ))}
       </nav>
 
-      {tab === "console" && <ConsolePane id={id} server={server} stats={stats} online={online} />}
-      {tab === "files" && <FilesPane id={id} />}
-      {tab === "databases" && <DatabasesPane id={id} />}
-      {tab === "schedules" && <SchedulesPane id={id} />}
-      {tab === "users" && <AccessPane id={id} />}
-      {tab === "backups" && <BackupsPane id={id} />}
-      {tab === "network" && <NetworkPane id={id} server={server} />}
-      {tab === "startup" && <StartupPane id={id} />}
-      {tab === "settings" && (
+      {activeTab === "console" && <ConsolePane id={id} server={server} stats={stats} online={online} />}
+      {activeTab === "terminal" && canTerminal && (
+        <TerminalPane id={id} server={server} user={user} onSudoChanged={load} />
+      )}
+      {activeTab === "files" && <FilesPane id={id} />}
+      {activeTab === "minecraft" && <MinecraftPane id={id} server={server} onChanged={load} />}
+      {activeTab === "plugins" && <PluginsPane id={id} />}
+      {activeTab === "databases" && <DatabasesPane id={id} />}
+      {activeTab === "schedules" && <SchedulesPane id={id} />}
+      {activeTab === "users" && <AccessPane id={id} />}
+      {activeTab === "backups" && <BackupsPane id={id} />}
+      {activeTab === "network" && <NetworkPane id={id} server={server} />}
+      {activeTab === "startup" && <StartupPane id={id} />}
+      {activeTab === "settings" && (
         <SettingsPane
           id={id}
           server={server}
@@ -287,7 +320,7 @@ export default function ServerPage() {
           onDeleted={() => nav("/admin/servers")}
         />
       )}
-      {tab === "activity" && <ActivityPane id={id} />}
+      {activeTab === "activity" && <ActivityPane id={id} />}
     </div>
   );
 }
@@ -921,7 +954,7 @@ function DatabasesPane({ id }: { id: string }) {
 
 function SchedulesPane({ id }: { id: string }) {
   const [rows, setRows] = useState<any[]>([]);
-  const [form, setForm] = useState({ name: "Nightly restart", cron: "*/30 * * * *", action: "restart", payload: "" });
+  const [form, setForm] = useState({ name: "Nightly restart", cron: "0 4 * * *", action: "restart", payload: "" });
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
 
@@ -985,16 +1018,31 @@ function SchedulesPane({ id }: { id: string }) {
             <input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required />
           </div>
           <div className="field">
-            <label>Interval</label>
-            <select value={form.cron} onChange={(event) => setForm({ ...form, cron: event.target.value })}>
-              <option value="*/5 * * * *">Every 5 minutes</option>
-              <option value="*/15 * * * *">Every 15 minutes</option>
-              <option value="*/30 * * * *">Every 30 minutes</option>
-              <option value="*/60 * * * *">Every hour</option>
-              <option value="*/360 * * * *">Every 6 hours</option>
-              <option value="*/720 * * * *">Every 12 hours</option>
+            <label>Schedule</label>
+            <select
+              value={CRON_PRESETS.some((preset) => preset.value === form.cron) ? form.cron : "custom"}
+              onChange={(event) => {
+                if (event.target.value !== "custom") {
+                  setForm({ ...form, cron: event.target.value });
+                }
+              }}
+            >
+              {CRON_PRESETS.map((preset) => (
+                <option key={preset.value} value={preset.value}>{preset.label}</option>
+              ))}
+              <option value="custom">Custom cron expression</option>
             </select>
-            <span className="field-help">The scheduler resolves the first cron field as a minute interval.</span>
+            <input
+              className="mono"
+              value={form.cron}
+              onChange={(event) => setForm({ ...form, cron: event.target.value })}
+              placeholder="0 4 * * *"
+              aria-label="Cron expression"
+            />
+            <span className="field-help">
+              Five fields in UTC: minute, hour, day of month, month, weekday. Examples:
+              <code>0 4 * * *</code> daily at 04:00 and <code>0 4 * * 0</code> every Sunday.
+            </span>
           </div>
           <div className="field">
             <label>Action</label>
@@ -1032,7 +1080,7 @@ function SchedulesPane({ id }: { id: string }) {
                 <span className={`schedule-icon ${row.enabled ? "active" : ""}`}><Icon name={row.action === "restart" ? "rotate-right" : row.action === "backup" ? "box-archive" : row.action === "command" ? "terminal" : "power-off"} /></span>
                 <div className="schedule-body">
                   <strong>{row.name}</strong>
-                  <span><code>{row.cron}</code> · {row.action} · {row.last_run ? `last run ${timeAgo(row.last_run)}` : "never run"}</span>
+                  <span><code>{row.cron}</code> · {row.action} · {row.last_run ? `last run ${timeAgo(row.last_run)}` : "never run"}{row.next_run ? ` · next ${fmtDate(row.next_run)}` : ""}</span>
                 </div>
                 <div className="row-actions">
                   <button type="button" className={`switch ${row.enabled ? "on" : ""}`} onClick={() => toggle(row)} title={row.enabled ? "Pause schedule" : "Enable schedule"}>
@@ -1415,6 +1463,8 @@ function SettingsPane({
   const [busy, setBusy] = useState(false);
   const [suspendReason, setSuspendReason] = useState(server.suspended_reason || "");
   const [suspendOpen, setSuspendOpen] = useState(false);
+  const [tagDraft, setTagDraft] = useState((server.tags || []).join(", "));
+  const [tagBusy, setTagBusy] = useState(false);
 
   async function save(event: FormEvent) {
     event.preventDefault();
@@ -1465,6 +1515,38 @@ function SettingsPane({
       </form>
 
       <div className="settings-side">
+        <form
+          className="card"
+          onSubmit={async (event) => {
+            event.preventDefault();
+            setTagBusy(true);
+            try {
+              const tags = tagDraft.split(/[,\s]+/).map((item) => item.trim()).filter(Boolean);
+              await api.saveTags(id, tags);
+              notify("Tags updated");
+              await onSaved();
+            } catch (err: any) {
+              notify(err.message || "Unable to save tags", "error");
+            } finally {
+              setTagBusy(false);
+            }
+          }}
+        >
+          <div className="card-head"><div><h2>Tags</h2><p>Labels used to filter workloads on the dashboard.</p></div></div>
+          <div className="card-body">
+            <div className="field">
+              <label>Comma-separated tags</label>
+              <input value={tagDraft} onChange={(event) => setTagDraft(event.target.value)} placeholder="prod, api, eu" />
+              <span className="field-help">Letters, numbers, dots, dashes. Maximum 12 tags.</span>
+            </div>
+            {(server.tags || []).length > 0 && (
+              <div className="tag-row">
+                {(server.tags || []).map((tag) => <span className="tag-chip" key={tag}>{tag}</span>)}
+              </div>
+            )}
+            <button className="btn btn-primary" disabled={tagBusy}><Icon name={tagBusy ? "circle-notch" : "tags"} className={tagBusy ? "spin" : ""} /> Save tags</button>
+          </div>
+        </form>
         <div className="card">
           <div className="card-head"><div><h2>Maintenance</h2><p>Reinstall egg defaults onto the volume.</p></div></div>
           <div className="card-body">

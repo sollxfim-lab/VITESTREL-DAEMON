@@ -37,7 +37,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-USER_AGENT = "VITESTERTL/1.9.0 (Minecraft provisioning; +https://github.com/vitestl)"
+USER_AGENT = "VITESTERTL/2.0.0 (Minecraft provisioning; +https://github.com/vitestl)"
 HTTP_TIMEOUT = 30
 DOWNLOAD_TIMEOUT = 60
 DOWNLOAD_ATTEMPTS = 4
@@ -991,6 +991,86 @@ def _purpur_loaders(version: str) -> list[dict[str, Any]]:
     return output[:80]
 
 
+def latest_release(software_id: str) -> dict[str, Any]:
+    """Return the current stable release and loader/build for a software family."""
+    meta = software(software_id)
+    catalog = versions(meta["id"], "", False)
+    version = str(catalog["defaults"].get("version") or "")
+    loader = str(catalog["defaults"].get("loader_version") or "")
+    selected = next(
+        (row for row in catalog.get("versions") or [] if str(row.get("id") or "") == version),
+        {},
+    )
+    return {
+        "software": meta["id"],
+        "software_name": meta["name"],
+        "edition": meta["edition"],
+        "version": version,
+        "loader_version": loader,
+        "released": selected.get("released"),
+        "type": selected.get("type") or "release",
+        "notes": list(catalog.get("notes") or []),
+        "fetched_at": _now(),
+    }
+
+
+def check_update(
+    software_id: str,
+    current_version: str,
+    current_loader: str = "",
+) -> dict[str, Any]:
+    """Compare an installed server against the current upstream release."""
+    latest = latest_release(software_id)
+    # BungeeCord intentionally exposes a floating "latest" build. Comparing it
+    # textually would always report an update.
+    floating = latest["version"].lower() == "latest"
+    version_update = bool(latest["version"]) and not floating and current_version != latest["version"]
+    loader_update = bool(latest["loader_version"]) and current_loader != latest["loader_version"]
+    return {
+        "current": {
+            "software": software_id,
+            "version": current_version,
+            "loader_version": current_loader,
+        },
+        "latest": latest,
+        "update_available": bool(current_version) and (version_update or loader_update),
+        "version_update": bool(current_version) and version_update,
+        "loader_update": bool(current_version) and bool(latest["loader_version"]) and loader_update,
+        "floating_channel": floating,
+    }
+
+
+def content_update(
+    software_id: str,
+    project_id: str,
+    current_version_id: str,
+    *,
+    game_version: str = "",
+) -> dict[str, Any] | None:
+    """Return the newest compatible Modrinth version when it differs from the installed one."""
+    result = content_versions(
+        software_id,
+        project_id,
+        game_version=game_version,
+        limit=12,
+    )
+    rows = [row for row in result.get("data") or [] if row.get("id")]
+    if not rows:
+        return None
+    latest = rows[0]
+    if latest["id"] == current_version_id:
+        return None
+    return {
+        "id": latest["id"],
+        "name": latest.get("name") or "",
+        "version_number": latest.get("version_number") or "",
+        "game_versions": latest.get("game_versions") or [],
+        "loaders": latest.get("loaders") or [],
+        "date_published": latest.get("date_published"),
+        "files": latest.get("files") or [],
+    }
+
+
 def versions(software_id: str, version: str = "", include_snapshots: bool = False) -> dict[str, Any]:
     meta = software(software_id)
     key = meta["id"]
@@ -1693,7 +1773,17 @@ def install_server(
 
     if not meta["proxy"]:
         properties_path = path / "server.properties"
-        values = _base_properties(meta, port, memory, overrides)
+        # Preserve values an operator changed outside the installer. The
+        # current file is merged into the generated defaults before writing,
+        # so upgrades and reinstalls never reset MOTD, difficulty, whitelist
+        # or other gameplay settings.
+        current_properties = _read_properties(properties_path)
+        values = _base_properties(
+            meta,
+            port,
+            memory,
+            {**current_properties, **overrides},
+        )
         _write_properties(properties_path, values)
         _log(log, "Applied server.properties with the allocation port")
 

@@ -326,7 +326,7 @@ _STATIC_INDEX = '''\
       <div class="card"><div class="k">Status</div><div class="v ok">operational</div></div>
       <div class="card"><div class="k">Runtime</div><div class="v">python http.server</div></div>
       <div class="card"><div class="k">Region</div><div class="v">node-01</div></div>
-      <div class="card"><div class="k">Panel</div><div class="v">vitestl 1.9.0</div></div>
+      <div class="card"><div class="k">Panel</div><div class="v">vitestl 2.0.0</div></div>
     </div>
   </main>
 </body>
