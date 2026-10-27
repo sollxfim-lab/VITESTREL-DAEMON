@@ -52,8 +52,38 @@ from config import (
     docker_available,
     hostname,
 )
-from db import db, init_db, log_activity, new_server_id, next_port, row_to_dict, rows_to_list, utcnow
-from eggs import egg_by_id
+from db import (
+    db,
+    init_db,
+    log_activity,
+    new_server_id,
+    next_custom_id,
+    next_port,
+    parse_tags,
+    row_to_dict,
+    rows_to_list,
+    sync_catalog,
+    utcnow,
+)
+from eggs import NESTS, EGGS, default_egg_files, egg_by_id
+from minecraft import MinecraftError
+from minecraft import catalog as minecraft_catalog
+from minecraft import content_capabilities as minecraft_capabilities
+from minecraft import install_content as minecraft_install_content
+from minecraft import install_server as minecraft_install_server
+from minecraft import installed_content as minecraft_installed_content
+from minecraft import java_status as minecraft_java_status
+from minecraft import bedrock_status as minecraft_bedrock_status
+from minecraft import read_install_metadata as minecraft_install_metadata
+from minecraft import read_server_properties as minecraft_read_properties
+from minecraft import search_content as minecraft_search_content
+from minecraft import software as minecraft_software
+from minecraft import content_versions as minecraft_content_versions
+from minecraft import delete_content as minecraft_delete_content
+from minecraft import store_uploaded_content as minecraft_store_upload
+from minecraft import toggle_content as minecraft_toggle_content
+from minecraft import update_properties as minecraft_update_properties
+from minecraft import versions as minecraft_versions
 from runtime import dir_size, manager, substitute
 
 app = FastAPI(title=PANEL_NAME, version=PANEL_VERSION, docs_url=None, redoc_url=None)
@@ -130,6 +160,25 @@ class CreateServerBody(BaseModel):
     allocation_port: int | None = None
     environment: dict[str, str] = {}
     start_on_completion: bool = False
+    minecraft: dict[str, Any] | None = None
+    accept_eula: bool = False
+
+
+class MinecraftInstallBody(BaseModel):
+    software: str
+    version: str = ""
+    loader_version: str = ""
+    accept_eula: bool = False
+    properties: dict[str, Any] = {}
+
+
+class MinecraftPropertiesBody(BaseModel):
+    properties: dict[str, Any] = {}
+
+
+class PluginInstallBody(BaseModel):
+    project_id: str
+    version_id: str | None = None
 
 
 class CreateUserBody(BaseModel):
@@ -259,10 +308,75 @@ class SubuserBody(BaseModel):
     permissions: list[str] = []
 
 
+class NestBody(BaseModel):
+    name: str
+    description: str = ""
+
+
+class EggBody(BaseModel):
+    nest_id: int
+    name: str
+    description: str = ""
+    docker_image: str = "python:3.11-slim"
+    startup: str = "python3 main.py"
+    stop_command: str = "^C"
+    runtime: str = "process"
+    files: dict[str, str] | None = None
+    variables: list[dict[str, Any]] | None = None
+
+
+class ApiKeyBody(BaseModel):
+    name: str
+
+
+class TagsBody(BaseModel):
+    tags: list[str] = []
+
+
+def load_egg(egg_id: int) -> dict[str, Any] | None:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM eggs WHERE id = ?", (egg_id,)).fetchone()
+    egg = row_to_dict(row)
+    if egg:
+        try:
+            files = json.loads(egg.get("files") or "{}")
+        except json.JSONDecodeError:
+            files = {}
+        try:
+            variables = json.loads(egg.get("variables") or "[]")
+        except json.JSONDecodeError:
+            variables = []
+        egg["files"] = files if isinstance(files, dict) else {}
+        egg["variables"] = variables if isinstance(variables, list) else []
+        return egg
+    return egg_by_id(egg_id)
+
+
+def hash_api_key(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
 def user_from_header(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "Unauthenticated")
-    payload = decode_token(authorization.split(" ", 1)[1].strip())
+    raw = authorization.split(" ", 1)[1].strip()
+    if raw.startswith("vt_"):
+        token_hash = hash_api_key(raw)
+        with db() as conn:
+            key = row_to_dict(
+                conn.execute("SELECT * FROM api_keys WHERE token_hash = ?", (token_hash,)).fetchone()
+            )
+            if not key:
+                raise HTTPException(401, "Invalid token")
+            conn.execute("UPDATE api_keys SET last_used = ? WHERE id = ?", (utcnow(), key["id"]))
+            row = conn.execute("SELECT * FROM users WHERE id = ?", (key["user_id"],)).fetchone()
+        user = row_to_dict(row)
+        if not user:
+            raise HTTPException(401, "User missing")
+        user.pop("password_hash", None)
+        user["api_key_id"] = key["id"]
+        return user
+    payload = decode_token(raw)
     if not payload or "uid" not in payload:
         raise HTTPException(401, "Invalid token")
     with db() as conn:
@@ -989,7 +1103,7 @@ def _run_node_install(job_id: str, body: dict[str, Any], admin_id: int | None) -
 
 
 def install_egg_files(server_id: str, egg_id: int, env: dict[str, str]) -> None:
-    egg = egg_by_id(egg_id)
+    egg = load_egg(egg_id)
     if not egg:
         return
     root = SERVERS_DIR / server_id
@@ -1004,6 +1118,375 @@ def install_egg_files(server_id: str, egg_id: int, env: dict[str, str]) -> None:
         dest.write_text(text, encoding="utf-8")
         if dest.suffix == ".sh":
             dest.chmod(0o755)
+
+
+# ---------------------------------------------------------------------------
+# Minecraft provisioning jobs
+# ---------------------------------------------------------------------------
+
+MC_JOBS: dict[str, dict[str, Any]] = {}
+MC_JOB_LOCK = threading.Lock()
+
+
+def _mc_job_log(job_id: str, message: str) -> None:
+    line = f"[{utcnow()}] {str(message)[:800]}"
+    with MC_JOB_LOCK:
+        job = MC_JOBS.get(job_id)
+        if not job:
+            return
+        job["logs"].append(line)
+        if len(job["logs"]) > 600:
+            del job["logs"][:100]
+        job["updated_at"] = utcnow()
+
+
+def _mc_job_update(job_id: str, **fields: Any) -> None:
+    with MC_JOB_LOCK:
+        job = MC_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(fields)
+        job["updated_at"] = utcnow()
+
+
+def _mc_job_snapshot(job_id: str) -> dict[str, Any] | None:
+    with MC_JOB_LOCK:
+        job = MC_JOBS.get(job_id)
+        if not job:
+            return None
+        data = {key: value for key, value in job.items() if key != "logs"}
+        data["logs"] = list(job["logs"])
+        return data
+
+
+def _latest_mc_job(server_id: str) -> dict[str, Any] | None:
+    with MC_JOB_LOCK:
+        matches = [job for job in MC_JOBS.values() if job.get("server_id") == server_id]
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+    return _mc_job_snapshot(matches[0]["id"])
+
+
+def _mc_config(payload: dict[str, Any] | None, default_software: str) -> dict[str, Any]:
+    raw = payload or {}
+    meta = minecraft_software(str(raw.get("software") or default_software))
+    version = str(raw.get("version") or "").strip()[:80]
+    loader = str(raw.get("loader_version") or "").strip()[:128]
+    properties = raw.get("properties")
+    if not isinstance(properties, dict):
+        properties = {}
+    clean_properties = {
+        str(key)[:64]: str(value)[:256]
+        for key, value in properties.items()
+        if str(key) and "\n" not in str(key)
+    }
+    return {
+        "software": meta["id"],
+        "software_name": meta["name"],
+        "edition": meta["edition"],
+        "kind": meta["kind"],
+        "version": version,
+        "loader_version": loader,
+        "accept_eula": bool(raw.get("accept_eula")),
+        "properties": clean_properties,
+    }
+
+
+def _server_mc_software(server: dict[str, Any]) -> str:
+    software_id = str(server.get("mc_software") or "").strip().lower()
+    if software_id:
+        return software_id
+    if int(server.get("egg_id") or 0) == 28:
+        return "bedrock"
+    if int(server.get("egg_id") or 0) == 27:
+        return "vanilla"
+    return ""
+
+
+def _mc_install_worker(job_id: str, server_id: str, config: dict[str, Any], actor_id: int | None) -> None:
+    job = _mc_job_snapshot(job_id)
+    if not job:
+        return
+    software_id = config["software"]
+    version = config["version"]
+    _mc_job_update(job_id, status="running", progress=5)
+    _mc_job_log(job_id, f"Starting {config['software_name']} provisioning")
+    with db() as conn:
+        conn.execute(
+            "UPDATE servers SET mc_status = 'installing', mc_message = ? WHERE id = ?",
+            ("Downloading server files", server_id),
+        )
+    root = SERVERS_DIR / server_id
+    try:
+        result = minecraft_install_server(
+            root,
+            software_id,
+            version=version,
+            loader_version=config["loader_version"],
+            memory=int(job.get("memory") or 2048),
+            port=int(job.get("port") or 25565),
+            accept_eula=bool(config["accept_eula"]),
+            properties=config["properties"],
+            log=lambda line: _mc_job_log(job_id, line),
+        )
+        _mc_job_update(job_id, progress=85)
+        with db() as conn:
+            row = conn.execute("SELECT environment FROM servers WHERE id = ?", (server_id,)).fetchone()
+            try:
+                environment = json.loads((row["environment"] if row else "") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                environment = {}
+            environment.update(
+                {
+                    "MC_SOFTWARE": result["software"],
+                    "MC_VERSION": result["version"],
+                    "MC_LOADER": result["loader_version"],
+                    "MOTD": str(config["properties"].get("motd") or environment.get("MOTD") or ""),
+                }
+            )
+            conn.execute(
+                """UPDATE servers SET startup = ?, image = ?, environment = ?,
+                   mc_software = ?, mc_version = ?, mc_loader_version = ?,
+                   mc_status = 'installed', mc_message = ?, mc_installed_at = ?,
+                   mc_eula = ?
+                   WHERE id = ?""",
+                (
+                    result["startup"],
+                    result["image"],
+                    json.dumps(environment),
+                    result["software"],
+                    result["version"],
+                    result["loader_version"],
+                    "Ready to start",
+                    utcnow(),
+                    1 if config["accept_eula"] else 0,
+                    server_id,
+                ),
+            )
+        instance = manager.instances.get(server_id)
+        if instance:
+            instance.server.update(
+                {
+                    "startup": result["startup"],
+                    "image": result["image"],
+                    "environment": environment,
+                }
+            )
+        _mc_job_update(
+            job_id,
+            status="completed",
+            progress=100,
+            message="Server installation completed",
+            result=result,
+        )
+        _mc_job_log(job_id, f"Ready: {result['software_name']} {result['version']}")
+        for note in result.get("notes") or []:
+            _mc_job_log(job_id, note)
+        log_activity(actor_id, server_id, "minecraft:install", {
+            "software": result["software"],
+            "version": result["version"],
+            "loader_version": result["loader_version"],
+        })
+    except MinecraftError as exc:
+        message = str(exc)[:400]
+        _mc_job_update(job_id, status="failed", progress=100, message=message)
+        _mc_job_log(job_id, f"Installation failed: {message}")
+        with db() as conn:
+            conn.execute(
+                "UPDATE servers SET mc_status = 'failed', mc_message = ? WHERE id = ?",
+                (message, server_id),
+            )
+        log_activity(actor_id, server_id, "minecraft:install-failed", {
+            "software": software_id,
+            "version": version,
+            "error": message,
+        })
+    except Exception as exc:  # keep the job inspectable for unexpected failures
+        message = f"Unexpected installer error: {exc}"[:400]
+        _mc_job_update(job_id, status="failed", progress=100, message=message)
+        _mc_job_log(job_id, message)
+        with db() as conn:
+            conn.execute(
+                "UPDATE servers SET mc_status = 'failed', mc_message = ? WHERE id = ?",
+                (message, server_id),
+            )
+        log_activity(actor_id, server_id, "minecraft:install-failed", {
+            "software": software_id,
+            "version": version,
+            "error": message,
+        })
+
+
+async def _begin_mc_install(
+    server: dict[str, Any], config: dict[str, Any], actor_id: int | None
+) -> dict[str, Any]:
+    server_id = server["id"]
+    if _server_mc_software(server) == "bedrock" or config["edition"] == "bedrock":
+        expected_egg = 28
+    else:
+        expected_egg = 27
+    instance = manager.instances.get(server_id)
+    if instance and instance.proc and instance.proc.returncode is None:
+        await instance.stop(kill=False)
+    with db() as conn:
+        conn.execute(
+            """UPDATE servers SET egg_id = ?, mc_software = ?, mc_version = ?,
+               mc_loader_version = ?, mc_status = 'queued', mc_message = 'Queued for installation',
+               mc_eula = ? WHERE id = ?""",
+            (
+                expected_egg,
+                config["software"],
+                config["version"],
+                config["loader_version"],
+                1 if config["accept_eula"] else 0,
+                server_id,
+            ),
+        )
+    job_id = uuid.uuid4().hex
+    with MC_JOB_LOCK:
+        MC_JOBS[job_id] = {
+            "id": job_id,
+            "server_id": server_id,
+            "status": "queued",
+            "progress": 0,
+            "message": "Queued for installation",
+            "software": config["software"],
+            "software_name": config["software_name"],
+            "version": config["version"],
+            "loader_version": config["loader_version"],
+            "memory": int(server.get("memory") or 2048),
+            "port": int(server.get("allocation_port") or 25565),
+            "logs": [],
+            "created_at": utcnow(),
+            "updated_at": utcnow(),
+            "actor_id": actor_id,
+        }
+    asyncio.create_task(
+        asyncio.to_thread(_mc_install_worker, job_id, server_id, config, actor_id)
+    )
+    snapshot = _mc_job_snapshot(job_id) or {}
+    return snapshot
+
+
+def _plugin_rows(server_id: str) -> dict[str, dict[str, Any]]:
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM plugin_installs WHERE server_id = ?", (server_id,)
+        ).fetchall()
+    output: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        item = row_to_dict(row) or {}
+        output[str(item.get("filename") or "")] = item
+        base = str(item.get("filename") or "")
+        if base.endswith(".disabled"):
+            output[base[: -len(".disabled")]] = item
+    return output
+
+
+def _merge_installed_content(server_id: str, software_id: str) -> list[dict[str, Any]]:
+    installed = minecraft_installed_content(SERVERS_DIR / server_id, software_id)
+    tracked = _plugin_rows(server_id)
+    merged = []
+    for item in installed:
+        row = tracked.get(item["filename"]) or tracked.get(item["base_name"])
+        if row:
+            item = {
+                **item,
+                "title": row.get("title") or item["base_name"],
+                "project_id": row.get("project_id") or "",
+                "project_slug": row.get("project_slug") or "",
+                "version_id": row.get("version_id") or "",
+                "version_number": row.get("version_number") or "",
+                "icon_url": row.get("icon_url") or "",
+                "source": row.get("source") or item.get("source"),
+                "installed_at": row.get("installed_at"),
+                "tracked": True,
+            }
+        else:
+            item = {
+                **item,
+                "title": item["base_name"].rsplit(".", 1)[0].replace("_", " ").replace("-", " "),
+                "project_id": "",
+                "project_slug": "",
+                "version_id": "",
+                "version_number": "",
+                "icon_url": "",
+                "tracked": False,
+            }
+        merged.append(item)
+    return merged
+
+
+def _record_plugin(server_id: str, info: dict[str, Any]) -> None:
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO plugin_installs
+               (server_id, filename, directory, project_id, project_slug, title,
+                version_id, version_number, icon_url, source, size, installed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(server_id, filename) DO UPDATE SET
+                 directory = excluded.directory,
+                 project_id = excluded.project_id,
+                 project_slug = excluded.project_slug,
+                 title = excluded.title,
+                 version_id = excluded.version_id,
+                 version_number = excluded.version_number,
+                 icon_url = excluded.icon_url,
+                 source = excluded.source,
+                 size = excluded.size,
+                 installed_at = excluded.installed_at""",
+            (
+                server_id,
+                info.get("filename"),
+                info.get("directory") or "plugins",
+                info.get("project_id") or "",
+                info.get("project_slug") or "",
+                info.get("title") or info.get("name") or "",
+                info.get("version_id") or "",
+                info.get("version_number") or "",
+                info.get("icon_url") or "",
+                info.get("source") or "modrinth",
+                int(info.get("size") or 0),
+                info.get("installed_at") or utcnow(),
+            ),
+        )
+
+
+def _server_mc_payload(server: dict[str, Any]) -> dict[str, Any]:
+    software_id = _server_mc_software(server)
+    if not software_id:
+        return {
+            "available": False,
+            "software": None,
+            "capabilities": {"enabled": False, "kind": None, "loaders": []},
+            "job": _latest_mc_job(server["id"]),
+        }
+    try:
+        meta = minecraft_software(software_id)
+    except MinecraftError:
+        return {
+            "available": False,
+            "software": None,
+            "capabilities": {"enabled": False, "kind": None, "loaders": []},
+            "job": _latest_mc_job(server["id"]),
+        }
+    root = SERVERS_DIR / server["id"]
+    manifest = minecraft_install_metadata(root)
+    return {
+        "available": True,
+        "software": meta,
+        "version": server.get("mc_version") or manifest.get("version") or "",
+        "loader_version": server.get("mc_loader_version") or manifest.get("loader_version") or "",
+        "status": server.get("mc_status") or ("installed" if manifest else ""),
+        "message": server.get("mc_message") or "",
+        "installed_at": server.get("mc_installed_at") or manifest.get("installed_at"),
+        "eula": bool(server.get("mc_eula")),
+        "capabilities": minecraft_capabilities(software_id),
+        "properties": minecraft_read_properties(root, software_id),
+        "job": _latest_mc_job(server["id"]),
+        "manifest": manifest,
+    }
 
 
 def decorate_server(server: dict[str, Any]) -> dict[str, Any]:
@@ -1027,9 +1510,11 @@ def decorate_server(server: dict[str, Any]) -> dict[str, Any]:
             env = json.loads(env)
         except json.JSONDecodeError:
             env = {}
+    tags = parse_tags(server.get("tags"))
     return {
-        **{k: server[k] for k in server if k != "environment"},
+        **{k: server[k] for k in server if k not in ("environment", "tags")},
         "environment": env or {},
+        "tags": tags,
         "status": "suspended" if server.get("suspended") else stats["state"],
         "suspended": bool(server.get("suspended")),
         "identifier": server.get("short_id") or sid[:8],
@@ -1308,6 +1793,74 @@ def update_account(body: ProfileBody, user: dict[str, Any] = Depends(user_from_h
         updated = row_to_dict(conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()) or {}
     log_activity(user["id"], None, "account:update")
     return {"user": public_user(updated)}
+
+
+@app.get("/api/account/api-keys")
+def list_api_keys(user: dict[str, Any] = Depends(user_from_header)) -> dict[str, Any]:
+    with db() as conn:
+        rows = rows_to_list(
+            conn.execute(
+                "SELECT id, name, prefix, last_used, created_at FROM api_keys WHERE user_id = ? ORDER BY id DESC",
+                (user["id"],),
+            ).fetchall()
+        )
+    return {"data": rows}
+
+
+@app.post("/api/account/api-keys")
+def create_api_key(body: ApiKeyBody, user: dict[str, Any] = Depends(user_from_header)) -> dict[str, Any]:
+    name = (body.name or "").strip() or "API key"
+    token = "vt_" + secrets.token_urlsafe(32)
+    prefix = token[:12] + "..."
+    with db() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) AS c FROM api_keys WHERE user_id = ?", (user["id"],)
+        ).fetchone()["c"]
+        if int(count) >= 20:
+            raise HTTPException(400, "Maximum of 20 API keys per account")
+        cur = conn.execute(
+            """INSERT INTO api_keys (user_id, name, token_hash, prefix, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (user["id"], name[:80], hash_api_key(token), prefix, utcnow()),
+        )
+        key_id = cur.lastrowid
+    log_activity(user["id"], None, "account:api-key:create", {"id": key_id, "name": name})
+    return {
+        "data": {
+            "id": key_id,
+            "name": name[:80],
+            "prefix": prefix,
+            "token": token,
+            "created_at": utcnow(),
+        }
+    }
+
+
+@app.delete("/api/account/api-keys/{key_id}")
+def delete_api_key(key_id: int, user: dict[str, Any] = Depends(user_from_header)) -> dict[str, str]:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id FROM api_keys WHERE id = ? AND user_id = ?", (key_id, user["id"])
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "API key not found")
+        conn.execute("DELETE FROM api_keys WHERE id = ?", (key_id,))
+    log_activity(user["id"], None, "account:api-key:delete", {"id": key_id})
+    return {"status": "ok"}
+
+
+@app.put("/api/servers/{server_id}/tags")
+def update_server_tags(
+    server_id: str, body: TagsBody, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    if user["role"] != "admin" and server["owner_id"] != user["id"]:
+        raise HTTPException(403, "Only the owner can update tags")
+    tags = parse_tags(body.tags)
+    with db() as conn:
+        conn.execute("UPDATE servers SET tags = ? WHERE id = ?", (json.dumps(tags), server_id))
+    log_activity(user["id"], server_id, "server:tags", {"tags": tags})
+    return {"data": {"tags": tags}}
 
 
 @app.get("/api/servers")
@@ -1648,6 +2201,369 @@ def reinstall(server_id: str, user: dict[str, Any] = Depends(user_from_header)) 
     }
     install_egg_files(server_id, server["egg_id"], env)
     log_activity(user["id"], server_id, "server:reinstall")
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Minecraft catalogue and provisioning API
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/minecraft/catalog")
+def minecraft_catalog_endpoint(_: dict[str, Any] = Depends(user_from_header)) -> dict[str, Any]:
+    return {"data": minecraft_catalog()}
+
+
+@app.get("/api/minecraft/catalog/{software_id}/versions")
+def minecraft_version_catalog(
+    software_id: str,
+    version: str = Query(""),
+    include_snapshots: bool = Query(False),
+    _: dict[str, Any] = Depends(user_from_header),
+) -> dict[str, Any]:
+    try:
+        return {"data": minecraft_versions(software_id, version, include_snapshots)}
+    except MinecraftError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.get("/api/servers/{server_id}/minecraft")
+def server_minecraft(
+    server_id: str, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    return {"data": _server_mc_payload(server)}
+
+
+@app.get("/api/servers/{server_id}/minecraft/status")
+async def server_minecraft_status(
+    server_id: str, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    software_id = _server_mc_software(server)
+    if not software_id:
+        raise HTTPException(400, "This server is not a Minecraft workload")
+    instance = manager.instances.get(server_id)
+    running = bool(instance and instance.proc and instance.proc.returncode is None)
+    if not running:
+        return {
+            "data": {
+                "online": False,
+                "latency_ms": 0,
+                "error": "The server is not running",
+            }
+        }
+    if minecraft_software(software_id)["edition"] == "bedrock":
+        result = await asyncio.to_thread(
+            minecraft_bedrock_status, "127.0.0.1", int(server["allocation_port"])
+        )
+    else:
+        result = await asyncio.to_thread(
+            minecraft_java_status, "127.0.0.1", int(server["allocation_port"])
+        )
+    return {"data": result}
+
+
+@app.post("/api/servers/{server_id}/minecraft/install")
+async def server_minecraft_install(
+    server_id: str,
+    body: MinecraftInstallBody,
+    user: dict[str, Any] = Depends(user_from_header),
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    current = _server_mc_software(server)
+    try:
+        config = _mc_config(
+            {
+                "software": body.software,
+                "version": body.version,
+                "loader_version": body.loader_version,
+                "accept_eula": body.accept_eula,
+                "properties": body.properties,
+            },
+            current or "vanilla",
+        )
+    except MinecraftError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if current:
+        current_meta = minecraft_software(current)
+        if current_meta["edition"] != config["edition"]:
+            raise HTTPException(
+                400,
+                "Java and Bedrock editions cannot share one server directory. "
+                "Create a new workload for the other edition.",
+            )
+    active = _latest_mc_job(server_id)
+    if active and active.get("status") in ("queued", "running"):
+        raise HTTPException(409, "An installation is already running for this server")
+    if body.accept_eula:
+        config["accept_eula"] = True
+    job = await _begin_mc_install(server, config, user["id"])
+    return {"data": job}
+
+
+@app.get("/api/servers/{server_id}/minecraft/jobs/{job_id}")
+def server_minecraft_job(
+    server_id: str,
+    job_id: str,
+    user: dict[str, Any] = Depends(user_from_header),
+) -> dict[str, Any]:
+    get_server(server_id, user)
+    job = _mc_job_snapshot(job_id)
+    if not job or job.get("server_id") != server_id:
+        raise HTTPException(404, "Installation job not found")
+    return {"data": job}
+
+
+@app.put("/api/servers/{server_id}/minecraft/properties")
+def server_minecraft_properties(
+    server_id: str,
+    body: MinecraftPropertiesBody,
+    user: dict[str, Any] = Depends(user_from_header),
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    software_id = _server_mc_software(server)
+    if not software_id:
+        raise HTTPException(400, "This server is not a Minecraft workload")
+    try:
+        values = minecraft_update_properties(
+            SERVERS_DIR / server_id,
+            software_id,
+            body.properties,
+            port=int(server["allocation_port"]),
+            memory=int(server["memory"]),
+        )
+    except MinecraftError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    log_activity(user["id"], server_id, "minecraft:properties", {
+        "keys": list(body.properties.keys())[:20]
+    })
+    return {"data": values}
+
+
+@app.get("/api/servers/{server_id}/plugins")
+def server_plugins(
+    server_id: str, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    software_id = _server_mc_software(server)
+    if not software_id:
+        return {
+            "data": [],
+            "capabilities": {"enabled": False, "kind": None, "loaders": [], "directory": ""},
+            "counts": {"total": 0, "enabled": 0},
+        }
+    capabilities = minecraft_capabilities(software_id)
+    rows = _merge_installed_content(server_id, software_id) if capabilities["enabled"] else []
+    return {
+        "data": rows,
+        "capabilities": capabilities,
+        "counts": {
+            "total": len(rows),
+            "enabled": sum(1 for row in rows if row.get("enabled")),
+        },
+    }
+
+
+@app.get("/api/servers/{server_id}/plugins/search")
+def server_plugins_search(
+    server_id: str,
+    query: str = Query(""),
+    limit: int = Query(20),
+    offset: int = Query(0),
+    featured: bool = Query(False),
+    user: dict[str, Any] = Depends(user_from_header),
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    software_id = _server_mc_software(server)
+    if not software_id:
+        raise HTTPException(400, "This server is not a Minecraft workload")
+    try:
+        result = minecraft_search_content(
+            software_id,
+            query,
+            game_version=str(server.get("mc_version") or ""),
+            limit=limit,
+            offset=offset,
+            featured=featured,
+        )
+    except MinecraftError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return result
+
+
+@app.get("/api/servers/{server_id}/plugins/versions/{project_id}")
+def server_plugin_versions(
+    server_id: str,
+    project_id: str,
+    limit: int = Query(12),
+    user: dict[str, Any] = Depends(user_from_header),
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    software_id = _server_mc_software(server)
+    if not software_id:
+        raise HTTPException(400, "This server is not a Minecraft workload")
+    try:
+        return minecraft_content_versions(
+            software_id,
+            project_id,
+            game_version=str(server.get("mc_version") or ""),
+            limit=limit,
+        )
+    except MinecraftError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.post("/api/servers/{server_id}/plugins")
+async def server_plugin_install(
+    server_id: str,
+    body: PluginInstallBody,
+    user: dict[str, Any] = Depends(user_from_header),
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    software_id = _server_mc_software(server)
+    if not software_id:
+        raise HTTPException(400, "This server is not a Minecraft workload")
+    capabilities = minecraft_capabilities(software_id)
+    if not capabilities["enabled"]:
+        raise HTTPException(400, "This server software does not support plugins or mods")
+    try:
+        info = await asyncio.to_thread(
+            minecraft_install_content,
+            SERVERS_DIR / server_id,
+            software_id,
+            body.project_id,
+            version_id=body.version_id or "",
+            game_version=str(server.get("mc_version") or ""),
+            log=lambda line: None,
+        )
+    except MinecraftError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    _record_plugin(server_id, info)
+    log_activity(user["id"], server_id, "minecraft:content-install", {
+        "project": info.get("project_id"),
+        "title": info.get("title"),
+        "filename": info.get("filename"),
+    })
+    return {"data": info}
+
+
+@app.post("/api/servers/{server_id}/plugins/upload")
+async def server_plugin_upload(
+    server_id: str,
+    upload: UploadFile = File(...),
+    user: dict[str, Any] = Depends(user_from_header),
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    software_id = _server_mc_software(server)
+    if not software_id:
+        raise HTTPException(400, "This server is not a Minecraft workload")
+    capabilities = minecraft_capabilities(software_id)
+    if not capabilities["enabled"]:
+        raise HTTPException(400, "This server software does not support plugins or mods")
+    filename = Path(upload.filename or "").name
+    if not filename or not filename.lower().endswith((".jar", ".zip")):
+        raise HTTPException(400, "Upload a .jar or .zip plugin or mod archive")
+    temporary = SERVERS_DIR / server_id / ".vitestl-upload.tmp"
+    temporary.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    try:
+        with temporary.open("wb") as handle:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > 256 * 1024 * 1024:
+                    raise HTTPException(413, "Upload exceeds 256 MiB")
+                handle.write(chunk)
+        info = minecraft_store_upload(SERVERS_DIR / server_id, software_id, filename, temporary)
+    except MinecraftError as exc:
+        temporary.unlink(missing_ok=True)
+        raise HTTPException(400, str(exc)) from exc
+    except HTTPException:
+        temporary.unlink(missing_ok=True)
+        raise
+    finally:
+        await upload.close()
+    info.update(
+        {
+            "title": filename.rsplit(".", 1)[0].replace("_", " ").replace("-", " "),
+            "project_id": "",
+            "project_slug": "",
+            "version_id": "",
+            "version_number": "",
+            "icon_url": "",
+            "project_type": capabilities["project_type"],
+            "source": "upload",
+            "installed_at": utcnow(),
+        }
+    )
+    _record_plugin(server_id, info)
+    log_activity(user["id"], server_id, "minecraft:content-upload", {
+        "filename": filename,
+        "size": written,
+    })
+    return {"data": info}
+
+
+@app.post("/api/servers/{server_id}/plugins/{filename}/toggle")
+def server_plugin_toggle(
+    server_id: str,
+    filename: str,
+    user: dict[str, Any] = Depends(user_from_header),
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    software_id = _server_mc_software(server)
+    if not software_id:
+        raise HTTPException(400, "This server is not a Minecraft workload")
+    try:
+        result = minecraft_toggle_content(SERVERS_DIR / server_id, software_id, filename)
+    except MinecraftError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    with db() as conn:
+        conn.execute(
+            "UPDATE OR REPLACE plugin_installs SET filename = ? WHERE server_id = ? AND filename = ?",
+            (result["filename"], server_id, filename),
+        )
+    log_activity(user["id"], server_id, "minecraft:content-toggle", {
+        "filename": filename,
+        "enabled": result["enabled"],
+    })
+    return {"data": result}
+
+
+@app.delete("/api/servers/{server_id}/plugins/{filename}")
+def server_plugin_delete(
+    server_id: str,
+    filename: str,
+    user: dict[str, Any] = Depends(user_from_header),
+) -> dict[str, str]:
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    software_id = _server_mc_software(server)
+    if not software_id:
+        raise HTTPException(400, "This server is not a Minecraft workload")
+    try:
+        minecraft_delete_content(SERVERS_DIR / server_id, software_id, filename)
+    except MinecraftError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    base = filename
+    for suffix in (".jar.disabled", ".zip.disabled", ".disabled"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)] + (".jar" if "jar" in suffix else ".zip")
+            break
+    with db() as conn:
+        conn.execute(
+            "DELETE FROM plugin_installs WHERE server_id = ? AND filename IN (?, ?, ?)",
+            (server_id, filename, base, base + ".disabled"),
+        )
+    log_activity(user["id"], server_id, "minecraft:content-delete", {"filename": filename})
     return {"status": "ok"}
 
 
@@ -2372,7 +3288,81 @@ def admin_nests(_: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
         except json.JSONDecodeError:
             e["variables"] = []
         e.pop("files", None)
-    return {"nests": nests, "eggs": eggs}
+        e["custom"] = int(e.get("id") or 0) >= 1000
+    return {
+        "nests": nests,
+        "eggs": eggs,
+        "catalog": {"nests": len(NESTS), "eggs": len(EGGS), "version": PANEL_VERSION},
+    }
+
+
+@app.post("/api/admin/nests/sync")
+def admin_sync_nests(admin: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
+    with db() as conn:
+        result = sync_catalog(conn)
+    log_activity(admin["id"], None, "nests:sync", result)
+    return {"status": "ok", **result}
+
+
+@app.post("/api/admin/nests")
+def admin_create_nest(body: NestBody, admin: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
+    name = body.name.strip()
+    if len(name) < 2:
+        raise HTTPException(400, "Nest name is required")
+    description = (body.description or "").strip()
+    with db() as conn:
+        nest_id = next_custom_id(conn, "nests")
+        conn.execute(
+            "INSERT INTO nests (id, name, description) VALUES (?, ?, ?)",
+            (nest_id, name, description),
+        )
+    log_activity(admin["id"], None, "nest:create", {"id": nest_id, "name": name})
+    return {"data": {"id": nest_id, "name": name, "description": description}}
+
+
+@app.post("/api/admin/eggs")
+def admin_create_egg(body: EggBody, admin: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
+    name = body.name.strip()
+    if len(name) < 2:
+        raise HTTPException(400, "Egg name is required")
+    startup = (body.startup or "python3 main.py").strip()
+    runtime = (body.runtime or "process").strip() or "process"
+    if runtime not in ("process", "docker"):
+        raise HTTPException(400, "Runtime must be process or docker")
+    files = body.files if isinstance(body.files, dict) and body.files else default_egg_files()
+    variables = body.variables if isinstance(body.variables, list) else []
+    with db() as conn:
+        nest = conn.execute("SELECT id FROM nests WHERE id = ?", (body.nest_id,)).fetchone()
+        if not nest:
+            raise HTTPException(400, "Unknown nest")
+        egg_id = next_custom_id(conn, "eggs")
+        conn.execute(
+            """INSERT INTO eggs
+            (id, nest_id, name, description, docker_image, startup, stop_command, runtime, files, variables)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                egg_id,
+                body.nest_id,
+                name,
+                (body.description or "").strip(),
+                (body.docker_image or "python:3.11-slim").strip(),
+                startup,
+                body.stop_command or "^C",
+                runtime,
+                json.dumps(files),
+                json.dumps(variables),
+            ),
+        )
+    log_activity(admin["id"], None, "egg:create", {"id": egg_id, "name": name, "nest_id": body.nest_id})
+    return {"data": {"id": egg_id, "nest_id": body.nest_id, "name": name}}
+
+
+@app.get("/api/admin/eggs/{egg_id}")
+def admin_egg_detail(egg_id: int, _: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
+    egg = load_egg(egg_id)
+    if not egg:
+        raise HTTPException(404, "Egg not found")
+    return {"data": egg}
 
 
 @app.get("/api/admin/locations")
@@ -2760,7 +3750,25 @@ def admin_delete_allocation(
 async def admin_create_server(
     body: CreateServerBody, admin: dict[str, Any] = Depends(admin_user)
 ) -> dict[str, Any]:
-    egg = egg_by_id(body.egg_id)
+    mc_config: dict[str, Any] | None = None
+    if body.minecraft or int(body.egg_id) in (27, 28):
+        default_software = "bedrock" if int(body.egg_id) == 28 else "vanilla"
+        try:
+            mc_config = _mc_config(body.minecraft, default_software)
+        except MinecraftError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        body.egg_id = int(mc_config["kind"] == "bedrock" and 28 or 27)
+        if body.accept_eula:
+            mc_config["accept_eula"] = True
+        body.environment.update(
+            {
+                "MC_SOFTWARE": mc_config["software"],
+                "MC_VERSION": mc_config["version"],
+                "MC_LOADER": mc_config["loader_version"],
+                "MOTD": str(mc_config["properties"].get("motd") or ""),
+            }
+        )
+    egg = load_egg(body.egg_id)
     if not egg:
         raise HTTPException(400, "Unknown egg")
     name = body.name.strip()
@@ -2863,13 +3871,33 @@ async def admin_create_server(
                WHERE s.id = ?""",
             (sid,),
         ).fetchone()
-    server = decorate_server(row_to_dict(row) or {})
-    if body.start_on_completion:
-        inst = manager.get(row_to_dict(row) or server)
+    server_row = row_to_dict(row) or {}
+    server = decorate_server(server_row)
+    minecraft_job = None
+    if mc_config:
+        minecraft_job = await _begin_mc_install(
+            {
+                **server_row,
+                "id": sid,
+                "memory": body.memory,
+                "allocation_port": port,
+            },
+            mc_config,
+            admin["id"],
+        )
+        server["mc_software"] = mc_config["software"]
+        server["mc_version"] = mc_config["version"]
+        server["mc_loader_version"] = mc_config["loader_version"]
+        server["mc_status"] = "queued"
+        server["mc_message"] = "Queued for installation"
+        if body.start_on_completion:
+            server["mc_message"] = "The server will be ready to start after installation"
+    elif body.start_on_completion:
+        inst = manager.get(server_row)
         await inst.start()
         server["status"] = inst.status
         server["resources"] = inst.stats()
-    return {"data": server}
+    return {"data": server, "minecraft_job": minecraft_job}
 
 
 @app.post("/api/admin/servers/{server_id}/suspend")

@@ -2,15 +2,16 @@
 
 VITESTERTL is a Debian-first, self-hosted control plane for application and game servers. It pairs a FastAPI panel with a responsive React interface and a local node runtime covering the day-to-day work of running workloads: live console, resource telemetry, file management, backups, schedules, databases, allocations, subusers, and a complete audit trail.
 
-Version **1.7.0** adds the Debian production installer, an illustrated local-node auto-install workflow, local SVG artwork, and the VITESTERTL identity.
+Version **1.9.0** adds first-class Minecraft provisioning: automated Java and Bedrock installations from official upstream metadata, loader-aware plugin and mod management through Modrinth, live server-list status, and a refreshed sign-in surface with original Minecraft-inspired artwork.
 
 ## Highlights
 
+- **Minecraft servers** — install Vanilla, Paper, Purpur, Folia, Fabric, Quilt, Forge, NeoForge, Velocity, Waterfall, BungeeCord, or Bedrock Dedicated Server, choose the Minecraft version and loader build, accept the EULA, edit `server.properties`, query live status, and install plugins or mods from Modrinth or local uploads.
 - **Operations dashboard** — fleet health, node capacity, workload filters, live CPU/memory/disk figures, and recent activity.
 - **Server workspace** — console over WebSocket, power controls, command input, file editor and uploads, backups with download and restore, cron schedules, databases, network allocations, startup variables, access lists, and settings.
 - **Node management** — auto-install the local Debian host, inspect capacity, regenerate daemon tokens, copy the node configuration, and manage allocations in bulk.
 - **Administration** — server creation, suspend/unsuspend, ownership transfer, and full cleanup delete; user, location, nest, and egg management; paginated audit log; branding and panel settings.
-- **Account controls** — profile editing, password changes, and session termination.
+- **Account controls** — profile editing, password changes, session context, and revocable API keys (`vt_` bearer tokens).
 - **Interface** — Plus Jakarta Sans and JetBrains Mono, Font Awesome icons, local SVG artwork, a responsive dark design system, accessible dialogs, confirmations, and toasts. All assets are bundled locally; the UI makes no CDN requests.
 
 ## Stack
@@ -20,7 +21,7 @@ Version **1.7.0** adds the Debian production installer, an illustrated local-nod
 | Panel API | FastAPI, SQLite, psutil |
 | Interface | React 18, Vite 5, TypeScript, xterm.js |
 | Realtime | WebSocket console and resource streams |
-| Runtime | Python, Node.js, Java, static HTTP, shell, or Docker OCI images |
+| Runtime | Python, Node.js, Java, Minecraft, voice, databases, bots, Go/Rust/PHP/Deno, static HTTP, shell, or Docker OCI images |
 | Assets | npm-bundled Font Awesome, Plus Jakarta Sans, JetBrains Mono, local SVG art |
 
 ## Requirements
@@ -181,6 +182,7 @@ backend/
   db.py            SQLite schema, migrations, seed data, activity logging
   auth.py          Password hashing and JWT issue/verify
   runtime.py       Local process and Docker runtime, console streams
+  minecraft.py     Minecraft catalogues, installers, properties, content and pings
   eggs.py          Nests, eggs, startup templates, variables
   config.py        Paths, versions, defaults
 frontend/
@@ -206,6 +208,31 @@ When Docker is available, eggs marked `docker` are launched as OCI containers wi
 
 Each server receives an allocation. Start it from the console, then use **Open allocation** to reach the bound port through the panel proxy.
 
+## Minecraft servers
+
+Minecraft is a first-class workload type with dedicated eggs:
+
+| Edition | Egg | Software |
+|---------|-----|----------|
+| Java | Minecraft Java (auto-installer), egg 27 | Vanilla, Paper, Purpur, Folia, Fabric, Quilt, Forge, NeoForge, Velocity, Waterfall, BungeeCord |
+| Bedrock | Minecraft Bedrock (auto-installer), egg 28 | Bedrock Dedicated Server |
+
+The version picker reads live upstream catalogues rather than a bundled list:
+
+- **Vanilla** uses Mojang piston metadata.
+- **Paper**, **Folia**, and **Velocity** use the PaperMC Fill v3 API.
+- **Purpur** uses the PurpurMC API.
+- **Fabric** and **Quilt** use their loader metadata APIs.
+- **Forge** uses the promotions feed and Maven metadata; **NeoForge** uses the NeoForged Maven metadata.
+- **Waterfall** and **BungeeCord** use the PaperMC and SpigotMC CI APIs.
+- **Bedrock** uses Minecraft Services download metadata.
+
+Every server download is HTTPS-only and host-validated. Transient failures are retried with backoff, partial transfers resume with HTTP Range requests, and Java artifacts are checksum-verified whenever the upstream publishes a digest.
+
+Installations run as background jobs with live progress and logs. Existing worlds, plugins, mods, and configuration are preserved on reinstall. The panel writes the EULA choice, `server.properties`, and a restart-safe start script, and selects a matching Java runtime image from the version metadata. Java and Bedrock editions use different server directories and cannot share a single workload; choose the edition when creating the server.
+
+The **Minecraft** tab shows the installed build, live Java server-list or Bedrock RakNet status, and editable gameplay properties. The **Content** tab installs plugins or mods from Modrinth using the catalogues and loaders appropriate to the selected software. It can also toggle or remove installed files and accept `.jar` or `.zip` uploads. Vanilla, Bedrock, and proxy software expose only the capabilities that apply to them.
+
 ## Security checklist
 
 - Change the seeded administrator password and email.
@@ -226,6 +253,9 @@ All panel routes live under `/api`:
 - `POST /api/auth/login`, `GET /api/auth/me`, `POST /api/auth/password`
 - `GET /api/servers`, server detail, resources, power, command, activity
 - Files, startup, settings, reinstall, databases, backups, schedules, network, subusers
+- `GET /api/minecraft/catalog`, version and loader catalogues, Minecraft status and install jobs
+- `GET|PUT /api/servers/{id}/minecraft/properties`, `POST /api/servers/{id}/minecraft/install`
+- Plugin and mod search, versions, install, upload, toggle, and delete under `/api/servers/{id}/plugins`
 - `GET /api/admin/overview`, users, nodes, allocations, locations, nests, activity, settings
 - `GET /api/admin/node-installer/audit`
 - `POST /api/admin/node-installer/install`

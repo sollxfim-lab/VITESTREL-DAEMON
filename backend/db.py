@@ -234,30 +234,7 @@ def init_db() -> None:
                 ),
             )
 
-        if conn.execute("SELECT COUNT(*) AS c FROM nests").fetchone()["c"] == 0:
-            for nest in NESTS:
-                conn.execute(
-                    "INSERT INTO nests (id, name, description) VALUES (?, ?, ?)",
-                    (nest["id"], nest["name"], nest["description"]),
-                )
-            for egg in EGGS:
-                conn.execute(
-                    """INSERT INTO eggs
-                    (id, nest_id, name, description, docker_image, startup, stop_command, runtime, files, variables)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        egg["id"],
-                        egg["nest_id"],
-                        egg["name"],
-                        egg["description"],
-                        egg["docker_image"],
-                        egg["startup"],
-                        egg["stop_command"],
-                        egg["runtime"],
-                        json.dumps(egg["files"]),
-                        json.dumps(egg["variables"]),
-                    ),
-                )
+        sync_catalog(conn)
 
         if conn.execute("SELECT COUNT(*) AS c FROM settings").fetchone()["c"] == 0:
             defaults = {
@@ -305,11 +282,126 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     _add_column(conn, "servers", "node_id", "node_id INTEGER NOT NULL DEFAULT 1")
     _add_column(conn, "servers", "suspended", "suspended INTEGER NOT NULL DEFAULT 0")
     _add_column(conn, "servers", "suspended_reason", "suspended_reason TEXT NOT NULL DEFAULT ''")
+    _add_column(conn, "servers", "tags", "tags TEXT NOT NULL DEFAULT '[]'")
+    _add_column(conn, "servers", "mc_software", "mc_software TEXT NOT NULL DEFAULT ''")
+    _add_column(conn, "servers", "mc_version", "mc_version TEXT NOT NULL DEFAULT ''")
+    _add_column(conn, "servers", "mc_loader_version", "mc_loader_version TEXT NOT NULL DEFAULT ''")
+    _add_column(conn, "servers", "mc_status", "mc_status TEXT NOT NULL DEFAULT ''")
+    _add_column(conn, "servers", "mc_message", "mc_message TEXT NOT NULL DEFAULT ''")
+    _add_column(conn, "servers", "mc_installed_at", "mc_installed_at TEXT")
+    _add_column(conn, "servers", "mc_eula", "mc_eula INTEGER NOT NULL DEFAULT 0")
     _add_column(conn, "allocations", "node_id", "node_id INTEGER NOT NULL DEFAULT 1")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS api_keys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            token_hash TEXT UNIQUE NOT NULL,
+            prefix TEXT NOT NULL,
+            last_used TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS plugin_installs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_id TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            directory TEXT NOT NULL,
+            project_id TEXT NOT NULL DEFAULT '',
+            project_slug TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            version_id TEXT NOT NULL DEFAULT '',
+            version_number TEXT NOT NULL DEFAULT '',
+            icon_url TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT 'modrinth',
+            size INTEGER NOT NULL DEFAULT 0,
+            installed_at TEXT NOT NULL,
+            UNIQUE(server_id, filename)
+        )
+        """
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_servers_owner ON servers(owner_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_servers_node ON servers(node_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_created ON activity(created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_server ON activity(server_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(token_hash)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_plugin_installs_server ON plugin_installs(server_id)"
+    )
+
+
+def sync_catalog(conn: sqlite3.Connection) -> dict[str, int]:
+    for nest in NESTS:
+        conn.execute(
+            """INSERT INTO nests (id, name, description) VALUES (?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                 name = excluded.name,
+                 description = excluded.description""",
+            (nest["id"], nest["name"], nest["description"]),
+        )
+    for egg in EGGS:
+        conn.execute(
+            """INSERT INTO eggs
+            (id, nest_id, name, description, docker_image, startup, stop_command, runtime, files, variables)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                nest_id = excluded.nest_id,
+                name = excluded.name,
+                description = excluded.description,
+                docker_image = excluded.docker_image,
+                startup = excluded.startup,
+                stop_command = excluded.stop_command,
+                runtime = excluded.runtime,
+                files = excluded.files,
+                variables = excluded.variables""",
+            (
+                egg["id"],
+                egg["nest_id"],
+                egg["name"],
+                egg["description"],
+                egg["docker_image"],
+                egg["startup"],
+                egg["stop_command"],
+                egg["runtime"],
+                json.dumps(egg["files"]),
+                json.dumps(egg["variables"]),
+            ),
+        )
+    return {"nests": len(NESTS), "eggs": len(EGGS)}
+
+
+def next_custom_id(conn: sqlite3.Connection, table: str) -> int:
+    row = conn.execute(f"SELECT MAX(id) AS m FROM {table}").fetchone()
+    current = int(row["m"] or 0)
+    return max(current + 1, 1001)
+
+
+def parse_tags(raw: Any) -> list[str]:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = [part.strip() for part in raw.split(",") if part.strip()]
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        tag = "".join(
+            ch for ch in str(item).strip().lower().replace(" ", "-") if ch.isalnum() or ch in "._-"
+        )[:32]
+        if len(tag) < 1 or tag in seen:
+            continue
+        seen.add(tag)
+        out.append(tag)
+        if len(out) >= 12:
+            break
+    return out
 
 
 def _ensure_admin_identity(conn: sqlite3.Connection) -> None:
