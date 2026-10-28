@@ -77,7 +77,7 @@ Version 2.1.0 introduces a more complete operations surface with fine-grained su
 Clone the repository and install it as root on the host:
 
 ```bash
-git clone <your-repository-url> /opt/vitestl
+git clone [<your-repository-url>](https://github.com/sollxfim-lab/VITESTREL-DAEMON) /opt/vitestl
 cd /opt/vitestl
 sudo bash deploy/install.sh --domain panel.example.com
 ```
