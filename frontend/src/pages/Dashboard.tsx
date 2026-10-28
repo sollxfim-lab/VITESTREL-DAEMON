@@ -19,6 +19,7 @@ import {
   ErrorPanel,
   LoadingPage,
   PageHeader,
+  plural,
   StatusPill,
   notify,
 } from "../ui";
@@ -124,6 +125,8 @@ export default function Dashboard() {
   if (!servers && !error) return <LoadingPage label="Loading workloads and telemetry" />;
   if (!servers && error) return <ErrorPanel message={error} retry={() => load()} />;
 
+  const memberCount = overview ? Math.max(0, overview.users - overview.admins) : 0;
+
   const kpis = admin && overview
     ? [
         {
@@ -136,14 +139,14 @@ export default function Dashboard() {
         {
           label: "Node fleet",
           value: overview.nodes,
-          sub: `${overview.locations} locations`,
+          sub: plural(overview.locations, "location"),
           icon: "network-wired",
           tone: "info",
         },
         {
           label: "Panel users",
           value: overview.users,
-          sub: `${overview.admins} admin · ${Math.max(0, overview.users - overview.admins)} members`,
+          sub: `${plural(overview.admins, "admin")} · ${plural(memberCount, "member")}`,
           icon: "users",
           tone: "neutral",
         },
@@ -188,7 +191,7 @@ export default function Dashboard() {
 
   const systemCards = admin && overview
     ? [
-        { label: "CPU load", value: overview.cpu, detail: `${overview.cores} logical cores`, tone: "accent" },
+        { label: "CPU load", value: overview.cpu, detail: plural(overview.cores, "logical core"), tone: "accent" },
         { label: "Memory", value: overview.memory.percent, detail: `${fmtBytes(overview.memory.used)} of ${fmtBytes(overview.memory.total)}`, tone: "violet" },
         { label: "Disk", value: overview.disk.percent, detail: `${fmtBytes(overview.disk.used)} of ${fmtBytes(overview.disk.total)}`, tone: "success" },
       ]

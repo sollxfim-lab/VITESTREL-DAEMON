@@ -9,6 +9,7 @@ import ServerPage from "./pages/Server";
 import Admin, {
   ActivityLog,
   AdminServers,
+  DatabaseHosts,
   EditUser,
   Locations,
   Nests,
@@ -19,9 +20,11 @@ import Admin, {
   Nodes,
   Overview as AdminOverview,
   PanelSettings,
+  SystemHealth,
   Users as AdminUsers,
 } from "./pages/Admin";
 import Account from "./pages/Account";
+import AiProviders from "./pages/AiProviders";
 import { Toaster } from "./ui";
 
 export default function App() {
@@ -97,6 +100,9 @@ export default function App() {
             <Route path="users/new" element={<NewUser />} />
             <Route path="users/:id" element={<EditUser />} />
             <Route path="locations" element={<Locations />} />
+            <Route path="databases" element={<DatabaseHosts />} />
+            <Route path="ai" element={<AiProviders />} />
+            <Route path="system" element={<SystemHealth />} />
             <Route path="activity" element={<ActivityLog />} />
             <Route path="settings" element={<PanelSettings />} />
           </Route>

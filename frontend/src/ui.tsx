@@ -427,6 +427,12 @@ export function activityText(event: string): string {
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
+/** Formats a count with a correctly pluralized noun, e.g. "1 server" / "2,000 servers". */
+export function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
+  const value = Number.isFinite(count) ? count.toLocaleString() : `${count}`;
+  return `${value} ${count === 1 ? singular : pluralForm}`;
+}
+
 export function PasswordValue({ value }: { value: string }) {
   const [visible, setVisible] = useState(false);
   return (

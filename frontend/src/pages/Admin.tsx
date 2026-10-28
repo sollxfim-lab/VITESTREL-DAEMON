@@ -5,7 +5,9 @@ import {
   api,
   fmtBytes,
   fmtDate,
+  fmtUptime,
   timeAgo,
+  type AdminDatabaseHost,
   type EggCatalogEntry,
 } from "../api";
 import { Icon } from "../icons";
@@ -26,6 +28,7 @@ import {
   LoadingPage,
   Modal,
   PageHeader,
+  plural,
   StatusPill,
   notify,
 } from "../ui";
@@ -130,7 +133,7 @@ export function Overview() {
     {
       label: "CPU",
       value: data.cpu,
-      detail: `${data.cores} logical cores`,
+      detail: plural(data.cores, "logical core"),
       tone: "accent",
       icon: "microchip",
     },
@@ -168,7 +171,7 @@ export function Overview() {
       <section className="kpi-grid kpi-grid-wide">
         <Kpi label="Workloads" value={data.servers} sub={`${data.running} running · ${data.suspended} suspended`} icon="server" tone="accent" />
         <Kpi label="Node fleet" value={data.nodes} sub={`${data.locations} location${data.locations === 1 ? "" : "s"}`} icon="network-wired" tone="info" />
-        <Kpi label="Panel users" value={data.users} sub={`${data.eggs} eggs available`} icon="users" tone="neutral" />
+        <Kpi label="Panel users" value={data.users} sub={`${plural(data.eggs, "egg")} available`} icon="users" tone="neutral" />
         <Kpi label="Archives" value={data.backups} sub={`${fmtBytes(data.backup_bytes)} stored`} icon="box-archive" tone="success" />
         <Kpi label="Allocations" value={data.allocations.free} sub={`free of ${data.allocations.total}`} icon="plug" tone="violet" />
       </section>
@@ -396,7 +399,7 @@ export function AdminServers() {
       <PageHeader
         eyebrow="Administration"
         title="Servers"
-        description={`${rows.length} workloads · ${running} running · ${suspended} suspended`}
+        description={`${plural(rows.length, "workload")} · ${running} running · ${suspended} suspended`}
         actions={<Link className="btn btn-primary" to="/admin/servers/new"><Icon name="plus" /> Provision server</Link>}
       />
 
@@ -630,7 +633,7 @@ export function NewServer() {
     setSyncingEggs(true);
     try {
       const result = await api.adminSyncNests();
-      notify(`Catalogue synced: ${result.nests} nests and ${result.eggs} eggs`);
+      notify(`Catalogue synced: ${plural(result.nests, "nest")} and ${plural(result.eggs, "egg")}`);
       setCatalogToken((value) => value + 1);
     } catch (err: any) {
       notify(err?.message || "Catalogue sync failed", "error");
@@ -1195,7 +1198,7 @@ function NodeAutoInstall({
               </strong>
               <span>
                 {succeeded
-                  ? `#${job.result.node_id} · ${job.result.allocations} allocations · ${job.result.runtime} runtime`
+                  ? `#${job.result.node_id} · ${plural(job.result.allocations, "allocation")} · ${job.result.runtime} runtime`
                   : job.error || "The installer is working through the host audit."}
               </span>
             </div>
@@ -1250,7 +1253,7 @@ export function Nodes() {
       <PageHeader
         eyebrow="Administration"
         title="Node fleet"
-        description={`${rows.length} registered nodes · ${connected} connected · ${freePorts} free allocations`}
+        description={`${plural(rows.length, "registered node")} · ${connected} connected · ${plural(freePorts, "free allocation")}`}
         actions={
           <>
             <button type="button" className="btn btn-primary" onClick={() => setInstallerOpen(true)}>
@@ -1547,7 +1550,7 @@ export function NodeDetail() {
 
       <section className="kpi-grid kpi-grid-compact">
         <Kpi label="Connected" value={live ? "Live" : "Offline"} sub={live?.hostname || node.fqdn} icon="tower-broadcast" tone={live ? "success" : "neutral"} />
-        <Kpi label="CPU" value={live ? `${live.cpu}%` : "—"} sub={live ? `${live.cores} cores` : "No telemetry"} icon="microchip" tone="accent" />
+        <Kpi label="CPU" value={live ? `${live.cpu}%` : "—"} sub={live ? plural(live.cores, "core") : "No telemetry"} icon="microchip" tone="accent" />
         <Kpi label="Memory" value={live ? fmtBytes(live.memory.used) : "—"} sub={live ? `${live.memory.percent}% of ${fmtBytes(live.memory.total)}` : "No telemetry"} icon="memory" tone="violet" />
         <Kpi label="Disk" value={live ? fmtBytes(live.disk.used) : "—"} sub={live ? `${live.disk.percent}% of ${fmtBytes(live.disk.total)}` : "No telemetry"} icon="hard-drive" tone="info" />
       </section>
@@ -1826,7 +1829,7 @@ export function Nests() {
     setSyncing(true);
     try {
       const result = await api.adminSyncNests();
-      notify(`Catalogue synced: ${result.nests} nests and ${result.eggs} eggs`);
+      notify(`Catalogue synced: ${plural(result.nests, "nest")} and ${plural(result.eggs, "egg")}`);
       await load();
     } catch (err: any) {
       notify(err.message || "Catalogue sync failed", "error");
@@ -1911,6 +1914,7 @@ export function Nests() {
     setBulkBusy(true);
     let created = 0;
     let failed = 0;
+    const createdIds: number[] = [];
     for (const egg of bulkEggs) {
       const defaults = eggDefaults(egg);
       const minecraft = egg.id === 27 || egg.id === 28;
@@ -1951,6 +1955,7 @@ export function Nests() {
       try {
         const response: any = await api.adminCreateServer(payload);
         created += 1;
+        createdIds.push(egg.id);
         setBulkResults((current) =>
           current.map((result) =>
             result.eggId === egg.id
@@ -1981,6 +1986,7 @@ export function Nests() {
       }
     }
     setBulkBusy(false);
+    setSelectedEggs((current) => current.filter((id) => !createdIds.includes(id)));
     await load();
     notify(
       failed
@@ -1998,7 +2004,7 @@ export function Nests() {
       <PageHeader
         eyebrow="Administration"
         title="Nests & eggs"
-        description={`${installedCount} of ${eggs.length} eggs installed · ${nests.length} nests · catalogue ${catalog.version || "2.0.0"}`}
+        description={`${installedCount} of ${plural(eggs.length, "egg")} installed · ${plural(nests.length, "nest")} · catalogue ${catalog.version || "2.1.0"}`}
         actions={
           <>
             <button className="btn btn-ghost" onClick={load}><Icon name="arrows-rotate" /> Refresh</button>
@@ -2047,7 +2053,7 @@ export function Nests() {
           <span className="eyebrow">Deployment coverage</span>
           <div className="catalogue-overview-count">
             <strong>{installedCount}</strong>
-            <span>/ {eggs.length} eggs installed</span>
+            <span>/ {plural(eggs.length, "egg")} installed</span>
           </div>
           <p>
             {missingEggs.length
@@ -2099,7 +2105,7 @@ export function Nests() {
         >
           <Icon name="check-double" /> Select missing
         </button>
-        <span className="pill pill-neutral">{visibleNests.length} nests shown</span>
+        <span className="pill pill-neutral">{plural(visibleNests.length, "nest")} shown</span>
       </div>
 
       {selectedEggs.length > 0 && (
@@ -2390,7 +2396,7 @@ export function Nests() {
           <div className={`bulk-capacity ${bulkOverCapacity ? "is-over" : ""}`}>
             <div className="bulk-capacity-head">
               <span className="eyebrow">Node capacity</span>
-              <span>{bulkNodeData ? `${bulkEggs.length} planned servers` : "Choose a node"}</span>
+              <span>{bulkNodeData ? plural(bulkEggs.length, "planned server") : "Choose a node"}</span>
             </div>
             {bulkNodeData ? (
               <>
@@ -2538,7 +2544,7 @@ export function Users() {
       <PageHeader
         eyebrow="Administration"
         title="Panel users"
-        description={`${rows.length} accounts · ${rows.filter((user) => user.role === "admin").length} administrators`}
+        description={`${plural(rows.length, "account")} · ${plural(rows.filter((user) => user.role === "admin").length, "administrator")}`}
         actions={<Link className="btn btn-primary" to="/admin/users/new"><Icon name="user-plus" /> Create user</Link>}
       />
       <div className="toolbar">
@@ -2781,7 +2787,7 @@ export function Locations() {
 
   return (
     <div className="page">
-      <PageHeader eyebrow="Administration" title="Locations" description={`${rows.length} location${rows.length === 1 ? "" : "s"} grouping ${rows.reduce((sum, row) => sum + (row.nodes || 0), 0)} nodes.`} />
+      <PageHeader eyebrow="Administration" title="Locations" description={`${plural(rows.length, "location")} grouping ${plural(rows.reduce((sum, row) => sum + (row.nodes || 0), 0), "node")}.`} />
       <div className="location-layout">
         <form className="card form-card" onSubmit={create}>
           <div className="card-head"><div><h2>Add location</h2><p>Logical region for grouping nodes.</p></div></div>
@@ -2825,6 +2831,7 @@ export function ActivityLog() {
   const [filter, setFilter] = useState("");
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
+  const [loaded, setLoaded] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -2832,6 +2839,7 @@ export function ActivityLog() {
       const response = await api.adminActivity(50, offset, filter);
       setItems(response.data);
       setTotal(response.total);
+      setLoaded(true);
     } catch (err: any) {
       notify(err.message || "Unable to load audit log", "error");
     } finally {
@@ -2852,8 +2860,10 @@ export function ActivityLog() {
       <PageHeader
         eyebrow="Administration"
         title="Audit log"
-        description={`${total} recorded events across authentication, workloads, files and infrastructure.`}
-        actions={<button className="btn btn-ghost" onClick={load}><Icon name="arrows-rotate" /> Refresh</button>}
+        description={loaded
+          ? `${plural(total, "recorded event")} across authentication, workloads, files and infrastructure.`
+          : "Authentication, workload, file and infrastructure events for this panel."}
+        actions={<button className="btn btn-ghost" onClick={load} disabled={loading}><Icon name={loading ? "circle-notch" : "arrows-rotate"} className={loading ? "spin" : ""} /> {loading ? "Loading" : "Refresh"}</button>}
       />
       <div className="toolbar">
         <form className="search-field" onSubmit={applyFilter}>
@@ -2902,6 +2912,517 @@ export function ActivityLog() {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+export function DatabaseHosts() {
+  const [rows, setRows] = useState<AdminDatabaseHost[]>([]);
+  const [client, setClient] = useState(true);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState("");
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [form, setForm] = useState({
+    name: "",
+    engine: "mariadb",
+    host: "127.0.0.1",
+    port: 3306,
+    username: "root",
+    password: "",
+    linked_ip: "",
+    max_databases: 0,
+  });
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const response = await api.adminDatabaseHosts();
+      setRows(response.data);
+      setClient(response.meta.client);
+    } catch (err: any) {
+      notify(err.message || "Unable to load database hosts", "error");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  function resetForm() {
+    setForm({
+      name: "",
+      engine: "mariadb",
+      host: "127.0.0.1",
+      port: 3306,
+      username: "root",
+      password: "",
+      linked_ip: "",
+      max_databases: 0,
+    });
+    setEditingId(null);
+    setTestResult(null);
+  }
+
+  function startEdit(row: AdminDatabaseHost) {
+    setEditingId(row.id);
+    setForm({
+      name: row.name,
+      engine: row.engine,
+      host: row.host,
+      port: row.port,
+      username: row.username,
+      password: "",
+      linked_ip: row.linked_ip || "",
+      max_databases: row.max_databases || 0,
+    });
+    setTestResult(null);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  async function save(event: FormEvent) {
+    event.preventDefault();
+    setBusy("save");
+    setTestResult(null);
+    try {
+      const body: any = {
+        name: form.name.trim(),
+        engine: form.engine,
+        host: form.host.trim(),
+        port: Number(form.port),
+        username: form.username.trim(),
+        linked_ip: form.linked_ip.trim(),
+        max_databases: Number(form.max_databases),
+        ...(form.password ? { password: form.password } : {}),
+      };
+      if (editingId) {
+        await api.adminUpdateDatabaseHost(editingId, body);
+        notify("Database host updated");
+      } else {
+        await api.adminCreateDatabaseHost(body);
+        notify("Database host created");
+      }
+      resetForm();
+      await load();
+    } catch (err: any) {
+      notify(err.message || "Unable to save database host", "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function testDraft() {
+    setBusy("test");
+    setTestResult(null);
+    try {
+      const response = await api.adminTestDatabaseHostDraft({
+        name: form.name.trim() || "draft",
+        engine: form.engine,
+        host: form.host.trim(),
+        port: Number(form.port),
+        username: form.username.trim(),
+        password: form.password,
+        linked_ip: form.linked_ip.trim(),
+        max_databases: Number(form.max_databases),
+      });
+      setTestResult({
+        ok: true,
+        message: `Connected to ${response.version || "server"} in ${response.latency_ms}ms`,
+      });
+    } catch (err: any) {
+      setTestResult({ ok: false, message: err.message || "Connection failed" });
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function testExisting(row: AdminDatabaseHost) {
+    setBusy(`test:${row.id}`);
+    try {
+      const response = await api.adminTestDatabaseHost(row.id);
+      notify(`Connected to ${response.version || row.name} in ${response.latency_ms}ms`);
+    } catch (err: any) {
+      notify(err.message || "Connection failed", "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <div className="page">
+      <PageHeader
+        eyebrow="Administration"
+        title="Database hosts"
+        description={`${rows.length} MySQL or MariaDB host${rows.length === 1 ? "" : "s"} available for managed database provisioning.`}
+        actions={<button className="btn btn-ghost" onClick={load}><Icon name="arrows-rotate" /> Refresh</button>}
+      />
+      {!client && (
+        <div className="banner banner-warning">
+          <Icon name="circle-exclamation" />
+          <div>
+            <strong>The MySQL client is not installed on the panel host</strong>
+            <span>Install <code>mariadb-client</code> or <code>mysql-client</code> on Debian or Ubuntu to provision real databases. Local SQLite databases remain available.</span>
+          </div>
+        </div>
+      )}
+      <div className="two-pane database-host-layout">
+        <form className="card form-card" onSubmit={save}>
+          <div className="card-head">
+            <div>
+              <h2>{editingId ? "Edit database host" : "Add database host"}</h2>
+              <p>Provisioning uses the panel host's native MySQL client over TCP.</p>
+            </div>
+            {editingId && <span className="pill pill-warn"><Icon name="pen" /> Editing</span>}
+          </div>
+          <div className="card-body">
+            <div className="field"><label>Display name</label><input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="Primary MariaDB" required /></div>
+            <div className="field-row">
+              <div className="field">
+                <label>Engine</label>
+                <select value={form.engine} onChange={(event) => setForm({ ...form, engine: event.target.value, port: event.target.value === "mysql" ? 3306 : form.port })}>
+                  <option value="mariadb">MariaDB</option>
+                  <option value="mysql">MySQL</option>
+                </select>
+              </div>
+              <div className="field">
+                <label>Port</label>
+                <input type="number" min={1} max={65535} value={form.port} onChange={(event) => setForm({ ...form, port: Number(event.target.value) })} />
+              </div>
+            </div>
+            <div className="field"><label>Hostname or IP</label><input className="mono" value={form.host} onChange={(event) => setForm({ ...form, host: event.target.value })} placeholder="db.internal" required /></div>
+            <div className="field"><label>Administrator username</label><input className="mono" autoComplete="off" value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} required /></div>
+            <div className="field">
+              <label>Administrator password</label>
+              <input type="password" autoComplete="new-password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} placeholder={editingId ? "Leave blank to keep the stored password" : "Required"} required={!editingId} />
+              <span className="field-help">Stored in the panel database and passed to the client through the process environment only.</span>
+            </div>
+            <div className="field-row">
+              <div className="field">
+                <label>Linked IP</label>
+                <input className="mono" value={form.linked_ip} onChange={(event) => setForm({ ...form, linked_ip: event.target.value })} placeholder="Optional client address" />
+                <span className="field-help">MySQL user host. Use <code>%</code> when empty.</span>
+              </div>
+              <div className="field">
+                <label>Database limit</label>
+                <input type="number" min={0} value={form.max_databases} onChange={(event) => setForm({ ...form, max_databases: Number(event.target.value) })} />
+                <span className="field-help">0 means unlimited.</span>
+              </div>
+            </div>
+            {testResult && (
+              <div className={`notice ${testResult.ok ? "notice-ok" : "notice-warn"}`}>
+                <Icon name={testResult.ok ? "circle-check" : "circle-exclamation"} />
+                <span>{testResult.message}</span>
+              </div>
+            )}
+            <div className="btn-row">
+              {editingId && <button type="button" className="btn btn-ghost" onClick={resetForm}>Cancel edit</button>}
+              <button type="button" className="btn btn-ghost" onClick={testDraft} disabled={busy === "test" || !form.host.trim() || !form.username.trim() || (!editingId && !form.password)}>
+                <Icon name={busy === "test" ? "circle-notch" : "plug"} className={busy === "test" ? "spin" : ""} /> Test connection
+              </button>
+              <button className="btn btn-primary" disabled={busy === "save"}>
+                <Icon name={busy === "save" ? "circle-notch" : editingId ? "check" : "plus"} className={busy === "save" ? "spin" : ""} />
+                {editingId ? "Save host" : "Create host"}
+              </button>
+            </div>
+          </div>
+        </form>
+
+        <div className="card">
+          <div className="card-head"><div><h2>Provisioning hosts</h2><p>Databases created by servers can target any host below.</p></div><span className="pill pill-neutral">{rows.length}</span></div>
+          {loading ? (
+            <div className="table-loading"><Icon name="circle-notch" className="spin" /> Loading database hosts</div>
+          ) : (
+            <div className="database-host-list">
+              {rows.map((row) => (
+                <article className="database-host-card" key={row.id}>
+                  <div className="database-host-head">
+                    <span className="node-icon"><Icon name="database" /></span>
+                    <div>
+                      <strong>{row.name}</strong>
+                      <span className="mono">{row.host}:{row.port}</span>
+                    </div>
+                    <span className="pill pill-neutral">{row.engine === "mysql" ? "MySQL" : "MariaDB"}</span>
+                  </div>
+                  <div className="database-host-meta">
+                    <span><Icon name="user" /> {row.username}</span>
+                    <span><Icon name="server" /> {row.databases} database{row.databases === 1 ? "" : "s"}{row.max_databases ? ` of ${row.max_databases}` : ""}</span>
+                    <span><Icon name="network-wired" /> {row.linked_ip || "%"}</span>
+                  </div>
+                  <div className="database-host-actions">
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => testExisting(row)} disabled={busy === `test:${row.id}` || !client}>
+                      <Icon name={busy === `test:${row.id}` ? "circle-notch" : "plug"} className={busy === `test:${row.id}` ? "spin" : ""} /> Test
+                    </button>
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => startEdit(row)}><Icon name="pen" /> Edit</button>
+                    <ConfirmButton
+                      className="btn btn-danger-ghost btn-sm"
+                      icon="trash-can"
+                      title={`Delete ${row.name}?`}
+                      description={row.databases ? `This host still manages ${plural(row.databases, "database")}. Remove those databases before deleting the host.` : "The host configuration will be removed. Managed databases on the remote server are not dropped."}
+                      confirmLabel="Delete host"
+                      onConfirm={async () => {
+                        await api.adminDeleteDatabaseHost(row.id);
+                        notify("Database host deleted");
+                        if (editingId === row.id) resetForm();
+                        await load();
+                      }}
+                    >
+                      Delete
+                    </ConfirmButton>
+                  </div>
+                </article>
+              ))}
+              {!rows.length && <EmptyState icon="database" title="No database hosts" description="Add a MySQL or MariaDB host to provision managed databases for servers." />}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function healthTone(status: string): string {
+  if (["ok", "active", "enabled", "running"].includes(status)) return "ok";
+  if (["warn", "inactive", "unknown", "unavailable"].includes(status)) return "warn";
+  return "danger";
+}
+
+export function SystemHealth() {
+  const [data, setData] = useState<any>(null);
+  const [error, setError] = useState("");
+  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [loading, setLoading] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      setData(await api.adminSystem());
+      setError("");
+    } catch (err: any) {
+      setError(err.message || "Unable to load system health");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const timer = window.setInterval(load, 15000);
+    return () => window.clearInterval(timer);
+  }, [autoRefresh, load]);
+
+  if (error && !data) return <ErrorPanel message={error} retry={load} />;
+  if (!data) return <LoadingPage label="Reading host telemetry" />;
+
+  const securityOk = data.security.checks.filter((check: any) => check.status === "ok").length;
+  const securityWarn = data.security.checks.length - securityOk;
+
+  return (
+    <div className="page system-page">
+      <PageHeader
+        eyebrow="Administration"
+        title="System health"
+        description={`${data.host.pretty_name} | ${data.host.architecture} | up ${fmtUptime(data.host.uptime)}`}
+        actions={
+          <>
+            <label className="auto-refresh">
+              <input type="checkbox" checked={autoRefresh} onChange={(event) => setAutoRefresh(event.target.checked)} />
+              Auto refresh
+            </label>
+            <button type="button" className="btn btn-ghost" onClick={load} disabled={loading}>
+              <Icon name={loading ? "circle-notch" : "arrows-rotate"} className={loading ? "spin" : ""} /> Refresh
+            </button>
+          </>
+        }
+      />
+      {error && <div className="banner banner-error"><Icon name="circle-exclamation" /><span>{error}</span></div>}
+      {data.host.system !== "Linux" && (
+        <div className="banner banner-warning">
+          <Icon name="circle-info" />
+          <div>
+            <strong>Host health is tuned for Debian and Ubuntu Linux</strong>
+            <span>
+              This panel is running on {data.host.system}. Linux-only checks such as systemd,
+              AppArmor and SSH policy are shown as unavailable rather than failing.
+            </span>
+          </div>
+        </div>
+      )}
+      {data.failed_units.length > 0 && (
+        <div className="banner banner-warning">
+          <Icon name="triangle-exclamation" />
+          <div>
+            <strong>{data.failed_units.length} failed system unit{data.failed_units.length === 1 ? "" : "s"}</strong>
+            <span>{data.failed_units.map((unit: any) => unit.unit).join(", ")}</span>
+          </div>
+        </div>
+      )}
+
+      <section className="system-kpis">
+        <article className="card system-kpi">
+          <span className="system-kpi-icon tone-cpu"><Icon name="microchip" /></span>
+          <div><span>CPU</span><strong>{data.cpu.percent.toFixed(1)}%</strong><small>{plural(data.cpu.cores, "core")} at {data.cpu.frequency_mhz || 0} MHz</small></div>
+        </article>
+        <article className="card system-kpi">
+          <span className="system-kpi-icon tone-mem"><Icon name="memory" /></span>
+          <div><span>Memory</span><strong>{data.memory.percent.toFixed(1)}%</strong><small>{fmtBytes(data.memory.used)} of {fmtBytes(data.memory.total)}</small></div>
+        </article>
+        <article className="card system-kpi">
+          <span className="system-kpi-icon tone-disk"><Icon name="hard-drive" /></span>
+          <div><span>Swap</span><strong>{data.swap.percent.toFixed(1)}%</strong><small>{fmtBytes(data.swap.used)} of {fmtBytes(data.swap.total)}</small></div>
+        </article>
+        <article className="card system-kpi">
+          <span className="system-kpi-icon tone-uptime"><Icon name="gauge-high" /></span>
+          <div><span>Load average</span><strong>{data.cpu.load.map((value: number) => value.toFixed(2)).join(" / ")}</strong><small>1, 5 and 15 minute averages</small></div>
+        </article>
+      </section>
+
+      <div className="system-grid">
+        <section className="card">
+          <div className="card-head"><div><h2>Processor</h2><p>Per-core utilisation sampled on request.</p></div><span className="pill pill-neutral">{data.cpu.cores} logical / {data.cpu.physical} physical</span></div>
+          <div className="card-body">
+            <div className="core-grid">
+              {(data.cpu.per_core || []).map((value: number, index: number) => (
+                <div className="core-meter" key={index}>
+                  <span>Core {index}</span>
+                  <div className="meter-track"><span className="meter-fill" style={{ width: `${Math.min(100, value)}%` }} /></div>
+                  <strong>{value.toFixed(0)}%</strong>
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        <section className="card">
+          <div className="card-head"><div><h2>Storage</h2><p>Mounted block devices and capacity.</p></div></div>
+          <div className="table-wrap">
+            <table className="table">
+              <thead><tr><th>Mount</th><th>Device</th><th>Type</th><th>Usage</th></tr></thead>
+              <tbody>
+                {(data.disks || []).map((disk: any) => (
+                  <tr key={disk.mount}>
+                    <td><strong>{disk.mount}</strong><small className="muted block">{fmtBytes(disk.used)} of {fmtBytes(disk.total)}</small></td>
+                    <td className="mono muted">{disk.device}</td>
+                    <td><span className="pill pill-neutral">{disk.fstype || "unknown"}</span></td>
+                    <td>
+                      <div className="disk-usage">
+                        <div className="meter-track"><span className={`meter-fill ${disk.percent >= 90 ? "danger" : disk.percent >= 75 ? "warning" : ""}`} style={{ width: `${Math.min(100, disk.percent)}%` }} /></div>
+                        <span>{disk.percent.toFixed(0)}%</span>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+                {!data.disks.length && <tr><td colSpan={4}><EmptyState icon="hard-drive" title="No disks detected" description="The panel could not read mounted filesystems." /></td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section className="card">
+          <div className="card-head"><div><h2>Security posture</h2><p>Debian and Ubuntu host hardening checks.</p></div><span className={`pill ${securityWarn ? "pill-warn" : "pill-ok"}`}>{securityOk} ok / {securityWarn} attention</span></div>
+          <div className="card-body">
+            <div className="health-list">
+              {data.security.checks.map((check: any) => (
+                <div className="health-item" key={check.id}>
+                  <span className={`health-dot ${healthTone(check.status)}`}><Icon name={check.status === "ok" ? "check" : "circle-exclamation"} /></span>
+                  <div><strong>{check.label}</strong><span>{check.detail}</span></div>
+                </div>
+              ))}
+            </div>
+            <div className="identity-list">
+              <div><span>SSH password authentication</span><code>{data.security.ssh.password_authentication}</code></div>
+              <div><span>SSH root login</span><code>{data.security.ssh.permit_root_login}</code></div>
+              <div><span>SSH public key authentication</span><code>{data.security.ssh.pubkey_authentication}</code></div>
+              <div><span>Firewall</span><code>{data.security.firewall.manager} / {data.security.firewall.status}</code></div>
+            </div>
+          </div>
+        </section>
+
+        <section className="card">
+          <div className="card-head"><div><h2>Services</h2><p>systemd unit state for common panel dependencies.</p></div></div>
+          <div className="card-body">
+            <div className="service-grid">
+              {(data.services || []).filter((service: any) => service.installed !== false).map((service: any) => (
+                <div className="service-item" key={service.name}>
+                  <span className={`health-dot ${healthTone(service.active)}`} />
+                  <div><strong>{service.name}</strong><span>{service.active} / {service.enabled}</span></div>
+                </div>
+              ))}
+            </div>
+            {(data.services || []).filter((service: any) => service.installed !== false).length === 0 && (
+              <EmptyState
+                icon="server"
+                title="No systemd services detected"
+                description="Service state is available when the panel runs on a systemd-based Linux host."
+              />
+            )}
+          </div>
+        </section>
+
+        <section className="card">
+          <div className="card-head"><div><h2>Panel storage</h2><p>Database and workload data footprint.</p></div></div>
+          <div className="card-body">
+            <div className="identity-list">
+              <div><span>Data directory</span><code className="ellipsis">{data.panel.data.data_dir}</code></div>
+              <div><span>Panel database</span><span>{fmtBytes(data.panel.data.database_bytes)}</span></div>
+              <div><span>Server volumes</span><span>{fmtBytes(data.panel.data.servers_bytes)}</span></div>
+              <div><span>Backup archives</span><span>{fmtBytes(data.panel.data.backups_bytes)}</span></div>
+              <div><span>Servers</span><span>{data.panel.data.counts.servers}</span></div>
+              <div><span>Users</span><span>{data.panel.data.counts.users}</span></div>
+              <div><span>Databases</span><span>{data.panel.data.counts.databases}</span></div>
+            </div>
+            <div className="identity-list">
+              <div><span>Panel version</span><code>{data.panel.version}</code></div>
+              <div><span>Runtime</span><code>{data.panel.wings}</code></div>
+              <div><span>Python</span><code>{data.host.python}</code></div>
+              <div><span>Kernel</span><code>{data.host.release}</code></div>
+              <div><span>Docker</span><code>{data.docker.available ? `${data.docker.server_version || "installed"} / ${plural(data.docker.containers || 0, "container")}` : "not installed"}</code></div>
+            </div>
+          </div>
+        </section>
+
+        <section className="card">
+          <div className="card-head"><div><h2>Processes by memory</h2><p>Top resident consumers on the panel host.</p></div></div>
+          <div className="table-wrap">
+            <table className="table">
+              <thead><tr><th>PID</th><th>Process</th><th>User</th><th>Memory</th></tr></thead>
+              <tbody>
+                {data.processes.by_memory.map((proc: any) => (
+                  <tr key={`mem-${proc.pid}`}>
+                    <td className="mono">{proc.pid}</td>
+                    <td><strong>{proc.name}</strong><small className="muted block ellipsis">{proc.command}</small></td>
+                    <td className="muted">{proc.username}</td>
+                    <td className="mono">{fmtBytes(proc.memory_bytes)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section className="card">
+          <div className="card-head"><div><h2>Processes by CPU</h2><p>Top processors on the panel host.</p></div></div>
+          <div className="table-wrap">
+            <table className="table">
+              <thead><tr><th>PID</th><th>Process</th><th>User</th><th>CPU</th></tr></thead>
+              <tbody>
+                {data.processes.by_cpu.map((proc: any) => (
+                  <tr key={`cpu-${proc.pid}`}>
+                    <td className="mono">{proc.pid}</td>
+                    <td><strong>{proc.name}</strong><small className="muted block ellipsis">{proc.command}</small></td>
+                    <td className="muted">{proc.username}</td>
+                    <td className="mono">{proc.cpu_percent.toFixed(1)}%</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
+      <p className="system-footnote">
+        Snapshot generated {fmtDate(data.generated_at)}. Host telemetry is read directly from the panel service account.
+      </p>
     </div>
   );
 }

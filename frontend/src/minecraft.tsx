@@ -25,7 +25,7 @@ import {
   fmtDate,
 } from "./api";
 import { Icon } from "./icons";
-import { ConfirmButton, EmptyState, Modal, notify } from "./ui";
+import { ConfirmButton, EmptyState, Modal, notify, plural } from "./ui";
 import minecraftHero from "./assets/minecraft-hero.svg";
 
 export type MinecraftSetupValue = MinecraftInstallSelection & {
@@ -1200,7 +1200,7 @@ function ProjectDialog({
       open={!!project}
       onClose={busy ? () => undefined : onClose}
       title={project?.title || "Install content"}
-      description={project ? `${project.project_type === "plugin" ? "Plugin" : "Mod"}${project.author ? ` by ${project.author}` : ""} · ${project.downloads.toLocaleString()} downloads` : undefined}
+      description={project ? `${project.project_type === "plugin" ? "Plugin" : "Mod"}${project.author ? ` by ${project.author}` : ""} · ${plural(project.downloads, "download")}` : undefined}
       size="wide"
       footer={
         <>

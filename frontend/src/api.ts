@@ -8,6 +8,7 @@ export type User = {
   created_at?: string;
   last_login?: string | null;
   root_admin?: boolean;
+  two_factor_enabled?: boolean;
   servers?: number;
 };
 
@@ -42,13 +43,15 @@ export type Server = {
   allocation: { ip: string; port: number; alias: string };
   limits: { memory: number; cpu: number; disk: number; swap: number; io: number };
   resources: Stats;
-  environment: Record<string, string>;
-  startup: string;
+  environment?: Record<string, string>;
+  startup?: string;
   image: string;
   created_at: string;
   allocation_port: number;
   allocation_ip: string;
   tags?: string[];
+  permissions?: string[];
+  is_owner?: boolean;
   mc_software?: string;
   mc_version?: string;
   mc_loader_version?: string;
@@ -191,6 +194,79 @@ export type CatalogHealth = {
   known_egg_ids?: number[];
 };
 
+export type LoginResult =
+  | { token: string; user: User }
+  | { two_factor_required: true; challenge: string; expires_in: number };
+
+export type TwoFactorStatus = {
+  enabled: boolean;
+  recovery_codes_remaining: number;
+  issuer: string;
+  digits: number;
+  period: number;
+};
+
+export type PermissionGroup = {
+  group: string;
+  permissions: Array<{ id: string; label: string }>;
+};
+
+export type DatabaseHostOption = {
+  id: number;
+  name: string;
+  engine: string;
+  host: string;
+  port: number;
+};
+
+export type ServerDatabase = {
+  id: number;
+  server_id: string;
+  name: string;
+  username: string;
+  password: string;
+  host: string;
+  port: number;
+  host_id: number | null;
+  engine: string;
+  host_name?: string | null;
+  host_engine?: string | null;
+  created_at: string;
+};
+
+export type AdminDatabaseHost = DatabaseHostOption & {
+  username: string;
+  linked_ip: string;
+  max_databases: number;
+  created_at: string;
+  databases: number;
+  password_set: boolean;
+};
+
+export type ScheduleTask = {
+  id?: number;
+  action: string;
+  payload: string;
+  time_offset: number;
+  continue_on_failure: number | boolean;
+  sequence?: number;
+};
+
+export type Schedule = {
+  id: number;
+  server_id: string;
+  name: string;
+  cron: string;
+  action: string;
+  payload: string;
+  enabled: number;
+  last_run: string | null;
+  next_run: string | null;
+  created_at: string;
+  tasks: ScheduleTask[];
+  task_count: number;
+};
+
 export type TerminalInfo = {
   user: string;
   server: string;
@@ -202,6 +278,98 @@ export type TerminalInfo = {
   shell: string;
   platform: string;
   timeout_seconds: number;
+};
+
+export type AiProviderOption = {
+  id: number;
+  name: string;
+  kind: string;
+  model: string;
+  is_default: boolean;
+  enabled?: boolean;
+};
+
+export type AiProviderMessage = {
+  id: number;
+  role: "user" | "assistant";
+  content: string;
+  provider_id: number | null;
+  model: string;
+  created_at: string;
+  streaming?: boolean;
+  pending?: boolean;
+};
+
+export type AiHistory = {
+  data: AiProviderMessage[];
+  meta: {
+    providers: AiProviderOption[];
+    default_provider_id: number;
+    configured: boolean;
+    limits: { history: number; context_chars: number; message_chars: number };
+    server: { name: string; identifier: string };
+  };
+};
+
+export type AdminAiProvider = {
+  id: number;
+  name: string;
+  kind: string;
+  base_url: string;
+  model: string;
+  headers: Record<string, string>;
+  max_tokens: number;
+  temperature: number;
+  enabled: boolean;
+  is_default: boolean;
+  key_set: boolean;
+  requests: number;
+  last_used: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AiPreset = {
+  id: string;
+  name: string;
+  kind: string;
+  base_url: string;
+  model: string;
+  note: string;
+};
+
+export type AiUsage = {
+  totals: {
+    requests: number;
+    tokens: number;
+    succeeded: number;
+    failed: number;
+    avg_latency_ms: number;
+  };
+  providers: Array<{
+    id: number;
+    name: string;
+    kind: string;
+    model: string;
+    is_default: boolean;
+    requests: number;
+    tokens: number;
+    failures: number;
+    last_used: string | null;
+  }>;
+  recent: Array<{
+    id: number;
+    provider_id: number | null;
+    provider_name: string | null;
+    server_id: string;
+    model: string;
+    total_tokens: number;
+    latency_ms: number;
+    ok: boolean;
+    error: string;
+    created_at: string;
+  }>;
+  window_days: number;
 };
 
 export type EggCatalogEntry = {
@@ -376,11 +544,86 @@ export async function download(path: string, filename: string): Promise<void> {
   URL.revokeObjectURL(href);
 }
 
+/** Consume the copilot SSE stream. Events: meta, delta, done, error. */
+export async function streamAiChat(
+  serverId: string,
+  body: {
+    message: string;
+    provider_id?: number | null;
+    context?: string;
+    cwd?: string;
+    sudo?: boolean;
+  },
+  onEvent: (event: string, data: any) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  const headers = new Headers({ "Content-Type": "application/json", Accept: "text/event-stream" });
+  const token = getToken();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const res = await fetch(`/api/servers/${serverId}/ai/chat`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (res.status === 401) {
+    setToken(null);
+    window.location.replace("/login");
+    throw new Error("Session expired");
+  }
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const payload = await res.json();
+      detail = payload.detail || payload.error || detail;
+    } catch {
+      /* no json body */
+    }
+    throw new Error(typeof detail === "string" ? detail : "The copilot request failed");
+  }
+  if (!res.body) throw new Error("Streaming is not available in this browser");
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      let event = "message";
+      const dataLines: string[] = [];
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+      }
+      if (dataLines.length) {
+        const raw = dataLines.join("\n");
+        let payload: any = raw;
+        try {
+          payload = JSON.parse(raw);
+        } catch {
+          /* keep the raw string for unknown events */
+        }
+        onEvent(event, payload);
+      }
+      boundary = buffer.indexOf("\n\n");
+    }
+  }
+}
+
 export const api = {
   login: (username: string, password: string) =>
-    req<{ token: string; user: User }>("/api/auth/login", {
+    req<LoginResult>("/api/auth/login", {
       method: "POST",
       body: JSON.stringify({ username, password }),
+    }),
+  loginTwoFactor: (challenge: string, code: string) =>
+    req<{ token: string; user: User }>("/api/auth/2fa", {
+      method: "POST",
+      body: JSON.stringify({ challenge, code }),
     }),
   me: () => req<{ user: User }>("/api/auth/me"),
   meta: () => req<Meta>("/api/meta"),
@@ -411,6 +654,26 @@ export const api = {
     }),
   fileDelete: (id: string, root: string, files: string[]) =>
     req(`/api/servers/${id}/files/delete`, { method: "POST", body: JSON.stringify({ root, files }) }),
+  fileCompress: (id: string, root: string, files: string[], name: string) =>
+    req<{ status: string; name: string; bytes: number }>(`/api/servers/${id}/files/compress`, {
+      method: "POST",
+      body: JSON.stringify({ root, files, name }),
+    }),
+  fileExtract: (id: string, root: string, file: string, destination = "") =>
+    req<{ status: string; entries: number }>(`/api/servers/${id}/files/extract`, {
+      method: "POST",
+      body: JSON.stringify({ root, file, destination }),
+    }),
+  fileChmod: (id: string, root: string, files: string[], mode: string) =>
+    req<{ status: string; changed: number }>(`/api/servers/${id}/files/chmod`, {
+      method: "POST",
+      body: JSON.stringify({ root, files, mode }),
+    }),
+  fileCopy: (id: string, root: string, from: string, to: string) =>
+    req(`/api/servers/${id}/files/copy`, {
+      method: "POST",
+      body: JSON.stringify({ root, from, to }),
+    }),
   fileUpload: async (id: string, directory: string, file: File) => {
     const fd = new FormData();
     fd.append("upload", file);
@@ -427,9 +690,20 @@ export const api = {
   saveSettings: (id: string, body: any) =>
     req(`/api/servers/${id}/settings`, { method: "PUT", body: JSON.stringify(body) }),
   reinstall: (id: string) => req(`/api/servers/${id}/reinstall`, { method: "POST" }),
-  databases: (id: string) => req<{ data: any[] }>(`/api/servers/${id}/databases`),
-  createDatabase: (id: string, name: string) =>
-    req(`/api/servers/${id}/databases`, { method: "POST", body: JSON.stringify({ name }) }),
+  databases: (id: string) =>
+    req<{
+      data: ServerDatabase[];
+      meta: { hosts: DatabaseHostOption[]; limit: number; client: boolean };
+    }>(`/api/servers/${id}/databases`),
+  createDatabase: (id: string, name: string, hostId?: number | null, engine?: string) =>
+    req<{ data: ServerDatabase }>(`/api/servers/${id}/databases`, {
+      method: "POST",
+      body: JSON.stringify({
+        name,
+        ...(hostId ? { host_id: hostId } : {}),
+        ...(engine ? { engine } : {}),
+      }),
+    }),
   deleteDatabase: (id: string, dbId: number) =>
     req(`/api/servers/${id}/databases/${dbId}`, { method: "DELETE" }),
   backups: (id: string) => req<{ data: any[] }>(`/api/servers/${id}/backups`),
@@ -440,16 +714,27 @@ export const api = {
     req(`/api/servers/${id}/backups/${bid}`, { method: "DELETE" }),
   backupDownload: (id: string, bid: string, name: string) =>
     download(`/api/servers/${id}/backups/${bid}/download`, `${name}.tar.gz`),
-  schedules: (id: string) => req<{ data: any[] }>(`/api/servers/${id}/schedules`),
+  schedules: (id: string) => req<{ data: Schedule[] }>(`/api/servers/${id}/schedules`),
   createSchedule: (id: string, body: any) =>
-    req(`/api/servers/${id}/schedules`, { method: "POST", body: JSON.stringify(body) }),
+    req<{ data: Schedule }>(`/api/servers/${id}/schedules`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateSchedule: (id: string, sid: number, body: any) =>
+    req<{ data: Schedule }>(`/api/servers/${id}/schedules/${sid}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
   setSchedule: (id: string, sid: number, enabled: boolean) =>
-    req(`/api/servers/${id}/schedules/${sid}`, {
+    req<{ data: Schedule }>(`/api/servers/${id}/schedules/${sid}`, {
       method: "PATCH",
       body: JSON.stringify({ enabled }),
     }),
   runSchedule: (id: string, sid: number) =>
-    req(`/api/servers/${id}/schedules/${sid}/run`, { method: "POST" }),
+    req<{ status: string; tasks: Array<Record<string, any>> }>(
+      `/api/servers/${id}/schedules/${sid}/run`,
+      { method: "POST" }
+    ),
   deleteSchedule: (id: string, sid: number) =>
     req(`/api/servers/${id}/schedules/${sid}`, { method: "DELETE" }),
   network: (id: string) =>
@@ -465,12 +750,37 @@ export const api = {
     req(`/api/servers/${id}/network/${allocationId}/primary`, { method: "POST" }),
   deleteAllocation: (id: string, allocationId: number) =>
     req(`/api/servers/${id}/network/${allocationId}`, { method: "DELETE" }),
-  users: (id: string) => req<{ data: any[] }>(`/api/servers/${id}/users`),
+  users: (id: string) =>
+    req<{ data: any[]; meta: { permission_groups: PermissionGroup[] } }>(
+      `/api/servers/${id}/users`
+    ),
   createUser: (id: string, body: any) =>
     req(`/api/servers/${id}/users`, { method: "POST", body: JSON.stringify(body) }),
+  updateUser: (id: string, uid: number, body: any) =>
+    req(`/api/servers/${id}/users/${uid}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteUser: (id: string, uid: number) => req(`/api/servers/${id}/users/${uid}`, { method: "DELETE" }),
   serverActivity: (id: string) => req<{ data: Activity[] }>(`/api/servers/${id}/activity`),
   updateAccount: (body: any) => req<{ user: User }>("/api/account", { method: "PUT", body: JSON.stringify(body) }),
+  twoFactor: () => req<TwoFactorStatus>("/api/account/2fa"),
+  twoFactorSetup: (password: string) =>
+    req<{
+      secret: string;
+      otpauth_uri: string;
+      issuer: string;
+      account: string;
+      digits: number;
+      period: number;
+    }>("/api/account/2fa/setup", { method: "POST", body: JSON.stringify({ password }) }),
+  twoFactorEnable: (code: string) =>
+    req<{ status: string; recovery_codes: string[] }>("/api/account/2fa/enable", {
+      method: "POST",
+      body: JSON.stringify({ code }),
+    }),
+  twoFactorDisable: (password: string, code: string) =>
+    req<{ status: string }>("/api/account/2fa/disable", {
+      method: "POST",
+      body: JSON.stringify({ password, code }),
+    }),
   apiKeys: () => req<{ data: any[] }>("/api/account/api-keys"),
   createApiKey: (name: string) =>
     req<{ data: any }>("/api/account/api-keys", { method: "POST", body: JSON.stringify({ name }) }),
@@ -567,8 +877,72 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(body),
     }),
+  adminSystem: () => req<any>("/api/admin/system"),
+  adminDatabaseHosts: () =>
+    req<{ data: AdminDatabaseHost[]; meta: { client: boolean } }>("/api/admin/database-hosts"),
+  adminCreateDatabaseHost: (body: any) =>
+    req<{ data: { id: number; name: string } }>("/api/admin/database-hosts", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  adminUpdateDatabaseHost: (id: number, body: any) =>
+    req<{ status: string }>(`/api/admin/database-hosts/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  adminDeleteDatabaseHost: (id: number) =>
+    req(`/api/admin/database-hosts/${id}`, { method: "DELETE" }),
+  adminTestDatabaseHost: (id: number) =>
+    req<{ status: string; version: string; latency_ms: number }>(
+      `/api/admin/database-hosts/${id}/test`,
+      { method: "POST" }
+    ),
+  adminTestDatabaseHostDraft: (body: any) =>
+    req<{ status: string; version: string; latency_ms: number }>(
+      "/api/admin/database-hosts/test-connection",
+      { method: "POST", body: JSON.stringify(body) }
+    ),
   password: (current: string, new_password: string) =>
     req("/api/auth/password", { method: "POST", body: JSON.stringify({ current, new_password }) }),
+  aiHistory: (id: string) => req<AiHistory>(`/api/servers/${id}/ai`),
+  clearAiHistory: (id: string) =>
+    req<{ status: string; deleted: number }>(`/api/servers/${id}/ai`, { method: "DELETE" }),
+  adminAiProviders: () =>
+    req<{ data: AdminAiProvider[]; meta: { presets: AiPreset[]; kinds: string[]; default_provider_id: number } }>(
+      "/api/admin/ai/providers"
+    ),
+  adminCreateAiProvider: (body: any) =>
+    req<{ data: AdminAiProvider }>("/api/admin/ai/providers", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  adminUpdateAiProvider: (id: number, body: any) =>
+    req<{ data: AdminAiProvider }>(`/api/admin/ai/providers/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  adminDeleteAiProvider: (id: number) =>
+    req(`/api/admin/ai/providers/${id}`, { method: "DELETE" }),
+  adminDefaultAiProvider: (id: number) =>
+    req<{ data: AdminAiProvider }>(`/api/admin/ai/providers/${id}/default`, { method: "POST" }),
+  adminTestAiProvider: (id: number) =>
+    req<{ status: string; message: string; models: number; latency_ms: number }>(
+      `/api/admin/ai/providers/${id}/test`,
+      { method: "POST" }
+    ),
+  adminTestAiProviderDraft: (body: any) =>
+    req<{ status: string; message: string; models: number; latency_ms: number }>(
+      "/api/admin/ai/providers/test",
+      { method: "POST", body: JSON.stringify(body) }
+    ),
+  adminAiProviderModels: (id: number) =>
+    req<{ data: string[]; meta: { kind: string } }>(`/api/admin/ai/providers/${id}/models`),
+  adminAiProviderModelsDraft: (body: any) =>
+    req<{ data: string[]; meta: { kind: string } }>("/api/admin/ai/providers/models", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  adminAiUsage: (days = 30) => req<AiUsage>(`/api/admin/ai/usage?days=${days}`),
   terminalInfo: (id: string) =>
     req<{ data: TerminalInfo }>(`/api/servers/${id}/terminal`),
   setTerminalSudo: (id: string, enabled: boolean) =>

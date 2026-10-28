@@ -24,6 +24,9 @@ const NAV = {
     { to: "/admin/locations", label: "Locations", icon: "location-dot" },
     { to: "/admin/nests", label: "Nests & eggs", icon: "layer-group" },
     { to: "/admin/users", label: "Users", icon: "users" },
+    { to: "/admin/databases", label: "Database hosts", icon: "database" },
+    { to: "/admin/ai", label: "AI providers", icon: "brain" },
+    { to: "/admin/system", label: "System health", icon: "heart-pulse" },
     { to: "/admin/activity", label: "Audit log", icon: "clock-rotate-left" },
     { to: "/admin/settings", label: "Settings", icon: "sliders" },
   ],
@@ -42,6 +45,9 @@ function pageLabel(pathname: string): string {
     "/admin/nests": "Nests & eggs",
     "/admin/users": "Users",
     "/admin/users/new": "Create user",
+    "/admin/databases": "Database hosts",
+    "/admin/ai": "AI providers",
+    "/admin/system": "System health",
     "/admin/activity": "Audit log",
     "/admin/settings": "Settings",
   };
@@ -143,11 +149,11 @@ export default function Shell({
         <div className="side-foot">
           <div className="side-foot-row">
             <span>Panel</span>
-            <strong>{system?.version || "1.7.0"}</strong>
+            <strong>{system?.version || "2.1.0"}</strong>
           </div>
           <div className="side-foot-row">
             <span>Runtime</span>
-            <strong>{system?.wings || "1.7.0"}</strong>
+            <strong>{system?.wings || "2.1.0"}</strong>
           </div>
           <div className="side-foot-note">
             <Icon name={system?.docker ? "cube" : "microchip"} />

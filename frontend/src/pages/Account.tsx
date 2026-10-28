@@ -36,6 +36,22 @@ export default function Account() {
   const [keyName, setKeyName] = useState("Panel API");
   const [keyBusy, setKeyBusy] = useState(false);
   const [freshToken, setFreshToken] = useState("");
+  const [twoFactor, setTwoFactor] = useState<any>(null);
+  const [twoFactorPassword, setTwoFactorPassword] = useState("");
+  const [twoFactorCode, setTwoFactorCode] = useState("");
+  const [twoFactorSetup, setTwoFactorSetup] = useState<any>(null);
+  const [twoFactorRecovery, setTwoFactorRecovery] = useState<string[]>([]);
+  const [twoFactorBusy, setTwoFactorBusy] = useState("");
+
+  const loadTwoFactor = useCallback(async () => {
+    try {
+      setTwoFactor(await api.twoFactor());
+    } catch (err: any) {
+      notify(err.message || "Unable to load two-factor status", "error");
+    }
+  }, []);
+
+  useEffect(() => { loadTwoFactor(); }, [loadTwoFactor]);
 
   const loadKeys = useCallback(async () => {
     try {
@@ -96,6 +112,58 @@ export default function Account() {
       notify(err.message || "Unable to update password", "error");
     } finally {
       setPasswordBusy(false);
+    }
+  }
+
+  async function startTwoFactor(event: FormEvent) {
+    event.preventDefault();
+    setTwoFactorBusy("setup");
+    try {
+      const response = await api.twoFactorSetup(twoFactorPassword);
+      setTwoFactorSetup(response);
+      setTwoFactorPassword("");
+      setTwoFactorCode("");
+      notify("Authenticator secret generated");
+    } catch (err: any) {
+      notify(err.message || "Unable to start two-factor setup", "error");
+    } finally {
+      setTwoFactorBusy("");
+    }
+  }
+
+  async function enableTwoFactor(event: FormEvent) {
+    event.preventDefault();
+    setTwoFactorBusy("enable");
+    try {
+      const response = await api.twoFactorEnable(twoFactorCode.trim());
+      setTwoFactorRecovery(response.recovery_codes);
+      setTwoFactorSetup(null);
+      setTwoFactorCode("");
+      notify("Two-factor authentication enabled");
+      await refreshUser();
+      await loadTwoFactor();
+    } catch (err: any) {
+      notify(err.message || "Unable to enable two-factor authentication", "error");
+    } finally {
+      setTwoFactorBusy("");
+    }
+  }
+
+  async function disableTwoFactor(event: FormEvent) {
+    event.preventDefault();
+    setTwoFactorBusy("disable");
+    try {
+      await api.twoFactorDisable(twoFactorPassword, twoFactorCode.trim());
+      setTwoFactorPassword("");
+      setTwoFactorCode("");
+      setTwoFactorRecovery([]);
+      notify("Two-factor authentication disabled");
+      await refreshUser();
+      await loadTwoFactor();
+    } catch (err: any) {
+      notify(err.message || "Unable to disable two-factor authentication", "error");
+    } finally {
+      setTwoFactorBusy("");
     }
   }
 
@@ -218,6 +286,117 @@ export default function Account() {
           </div>
         </aside>
       </div>
+
+      <section className="card account-two-factor">
+        <div className="card-head">
+          <div>
+            <h2>Two-factor authentication</h2>
+            <p>Protect your account with a time-based authenticator and single-use recovery codes.</p>
+          </div>
+          <span className={`pill ${twoFactor?.enabled ? "pill-ok" : "pill-neutral"}`}>
+            <Icon name={twoFactor?.enabled ? "shield-check" : "shield"} />
+            {twoFactor?.enabled ? "Enabled" : "Not enabled"}
+          </span>
+        </div>
+        <div className="card-body">
+          {twoFactorRecovery.length > 0 && (
+            <div className="recovery-codes-panel">
+              <div>
+                <strong>Save these recovery codes now</strong>
+                <span>Each code works once if you lose access to your authenticator. They cannot be shown again.</span>
+              </div>
+              <div className="recovery-code-grid">
+                {twoFactorRecovery.map((recovery) => <code key={recovery}>{recovery}</code>)}
+              </div>
+              <div className="btn-row">
+                <CopyButton value={twoFactorRecovery.join("\n")} label="Copy codes" className="btn btn-ghost btn-sm" />
+                <button type="button" className="btn btn-ghost btn-sm" onClick={() => setTwoFactorRecovery([])}>
+                  <Icon name="check" /> I have saved them
+                </button>
+              </div>
+            </div>
+          )}
+
+          {twoFactor?.enabled ? (
+            <div className="two-factor-grid">
+              <div className="two-factor-status">
+                <span className="two-factor-icon"><Icon name="shield-check" /></span>
+                <div>
+                  <strong>Authenticator protection is active</strong>
+                  <span>
+                    {twoFactor.recovery_codes_remaining} of 10 recovery code
+                    {twoFactor.recovery_codes_remaining === 1 ? "" : "s"} remaining.
+                  </span>
+                </div>
+              </div>
+              <form className="two-factor-disable" onSubmit={disableTwoFactor}>
+                <div className="field">
+                  <label>Account password</label>
+                  <input type="password" autoComplete="current-password" value={twoFactorPassword} onChange={(event) => setTwoFactorPassword(event.target.value)} required />
+                </div>
+                <div className="field">
+                  <label>Authenticator or recovery code</label>
+                  <input value={twoFactorCode} onChange={(event) => setTwoFactorCode(event.target.value)} placeholder="123456" autoComplete="one-time-code" required />
+                </div>
+                <button className="btn btn-danger-ghost" disabled={twoFactorBusy === "disable"}>
+                  <Icon name={twoFactorBusy === "disable" ? "circle-notch" : "shield"} className={twoFactorBusy === "disable" ? "spin" : ""} /> Disable two-factor
+                </button>
+              </form>
+            </div>
+          ) : twoFactorSetup ? (
+            <div className="two-factor-setup">
+              <div className="setup-steps">
+                <div className="setup-step">
+                  <span>1</span>
+                  <div>
+                    <strong>Add the secret to your authenticator</strong>
+                    <p>Scan the URI with a compatible app, or enter the secret manually. Use SHA-1, six digits and a 30-second period.</p>
+                    <div className="secret-box">
+                      <code>{twoFactorSetup.secret}</code>
+                      <CopyButton value={twoFactorSetup.secret} label="Copy secret" className="btn btn-ghost btn-sm" />
+                    </div>
+                    <a className="btn btn-ghost btn-sm" href={twoFactorSetup.otpauth_uri}>
+                      <Icon name="arrow-up-right-from-square" /> Open authenticator URI
+                    </a>
+                  </div>
+                </div>
+                <div className="setup-step">
+                  <span>2</span>
+                  <form onSubmit={enableTwoFactor}>
+                    <div className="field">
+                      <label>Verification code</label>
+                      <input value={twoFactorCode} onChange={(event) => setTwoFactorCode(event.target.value)} placeholder="123456" autoComplete="one-time-code" required />
+                    </div>
+                    <div className="btn-row">
+                      <button type="button" className="btn btn-ghost" onClick={() => setTwoFactorSetup(null)}>Cancel</button>
+                      <button className="btn btn-primary" disabled={twoFactorBusy === "enable"}>
+                        <Icon name={twoFactorBusy === "enable" ? "circle-notch" : "check"} className={twoFactorBusy === "enable" ? "spin" : ""} /> Enable two-factor
+                      </button>
+                    </div>
+                  </form>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <form className="two-factor-intro" onSubmit={startTwoFactor}>
+              <div className="two-factor-status">
+                <span className="two-factor-icon muted"><Icon name="shield" /></span>
+                <div>
+                  <strong>Add a second factor to your account</strong>
+                  <span>You will need your account password and an authenticator app such as Aegis, 1Password or Google Authenticator.</span>
+                </div>
+              </div>
+              <div className="field">
+                <label>Confirm your account password</label>
+                <input type="password" autoComplete="current-password" value={twoFactorPassword} onChange={(event) => setTwoFactorPassword(event.target.value)} required />
+              </div>
+              <button className="btn btn-primary" disabled={twoFactorBusy === "setup"}>
+                <Icon name={twoFactorBusy === "setup" ? "circle-notch" : "shield-halved"} className={twoFactorBusy === "setup" ? "spin" : ""} /> Set up two-factor
+              </button>
+            </form>
+          )}
+        </div>
+      </section>
 
       <section className="card account-keys">
         <div className="card-head">
