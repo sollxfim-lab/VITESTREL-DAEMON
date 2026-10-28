@@ -1,7 +1,7 @@
 # VITESTERTL
 
 <p align="center">
-  <img src="favicon.svg" alt="VITESTERTL logo" width="120" />
+  <img src="frontend/public/favicon.svg" alt="VITESTERTL logo" width="120" />
 </p>
 
 <p align="center">
