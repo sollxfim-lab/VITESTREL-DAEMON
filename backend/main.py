@@ -17,6 +17,7 @@ import tarfile
 import threading
 import time
 import uuid
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -38,7 +39,28 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from auth import decode_token, hash_password, sign_token, verify_password
+from auth import (
+    decode_token,
+    generate_recovery_code,
+    generate_totp_secret,
+    hash_password,
+    hash_recovery_code,
+    otpauth_uri,
+    sign_token,
+    verify_password,
+    verify_totp,
+)
+from ai import (
+    AI_KINDS,
+    AI_PRESETS,
+    ProviderError,
+    estimate_usage as ai_estimate_usage,
+    list_models as ai_list_models,
+    normalize_headers as ai_normalize_headers,
+    public_provider as ai_public_provider,
+    stream_chat as ai_stream_chat,
+    test_provider as ai_test_provider,
+)
 from config import (
     ALLOC_PORT_END,
     ALLOC_PORT_START,
@@ -137,6 +159,32 @@ class FileRenameBody(BaseModel):
 class FileDeleteBody(BaseModel):
     root: str = "/"
     files: list[str]
+
+
+class FileCompressBody(BaseModel):
+    root: str = "/"
+    files: list[str]
+    name: str = ""
+
+
+class FileExtractBody(BaseModel):
+    root: str = "/"
+    file: str
+    destination: str = ""
+
+
+class FileChmodBody(BaseModel):
+    root: str = "/"
+    files: list[str]
+    mode: str
+
+
+class FileCopyBody(BaseModel):
+    root: str = "/"
+    from_name: str = Field(alias="from")
+    to_name: str = Field(alias="to")
+
+    model_config = {"populate_by_name": True}
 
 
 class StartupBody(BaseModel):
@@ -314,14 +362,75 @@ class PasswordBody(BaseModel):
 
 class DatabaseBody(BaseModel):
     name: str
+    host_id: int | None = None
+    engine: str | None = None
+
+
+class DatabaseHostBody(BaseModel):
+    name: str
+    host: str
+    username: str
+    password: str = ""
+    engine: str = "mariadb"
+    port: int = 3306
+    linked_ip: str = ""
+    max_databases: int = 0
+
+
+class AiProviderBody(BaseModel):
+    id: int | None = None
+    name: str = ""
+    kind: str = "openai"
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    headers: Any = None
+    max_tokens: int = 2048
+    temperature: float = 0.4
+    enabled: bool = True
+    is_default: bool = False
+
+
+class AiChatBody(BaseModel):
+    message: str = ""
+    provider_id: int | None = None
+    context: str = ""
+    cwd: str = "/"
+    sudo: bool | None = None
+
+
+class TwoFactorCodeBody(BaseModel):
+    code: str
+
+
+class TwoFactorSetupBody(BaseModel):
+    password: str = ""
+
+
+class TwoFactorDisableBody(BaseModel):
+    password: str
+    code: str = ""
+
+
+class TwoFactorLoginBody(BaseModel):
+    challenge: str
+    code: str
+
+
+class ScheduleTaskBody(BaseModel):
+    action: str
+    payload: str = ""
+    time_offset: int = 0
+    continue_on_failure: bool = True
 
 
 class ScheduleBody(BaseModel):
     name: str
     cron: str
-    action: str
+    action: str | None = None
     payload: str = ""
     enabled: bool = True
+    tasks: list[ScheduleTaskBody] = []
 
 
 class SubuserBody(BaseModel):
@@ -432,7 +541,7 @@ def user_from_header(authorization: str | None = Header(default=None)) -> dict[s
         user["api_key_id"] = key["id"]
         return user
     payload = decode_token(raw)
-    if not payload or "uid" not in payload:
+    if not payload or "uid" not in payload or payload.get("typ") == "2fa":
         raise HTTPException(401, "Invalid token")
     with db() as conn:
         row = conn.execute("SELECT * FROM users WHERE id = ?", (payload["uid"],)).fetchone()
@@ -447,6 +556,143 @@ def admin_user(user: dict[str, Any] = Depends(user_from_header)) -> dict[str, An
     if user.get("role") != "admin":
         raise HTTPException(403, "Administrator privileges required")
     return user
+
+
+# ---------------------------------------------------------------------------
+# Granular server permissions (Pterodactyl-compatible capability names)
+# ---------------------------------------------------------------------------
+
+SERVER_PERMISSION_GROUPS: list[dict[str, Any]] = [
+    {
+        "group": "Console",
+        "permissions": [
+            {"id": "websocket.connect", "label": "Connect to console streams"},
+            {"id": "control.console", "label": "Send console commands"},
+            {"id": "control.start", "label": "Start the server"},
+            {"id": "control.stop", "label": "Stop the server"},
+            {"id": "control.restart", "label": "Restart the server"},
+        ],
+    },
+    {
+        "group": "Files",
+        "permissions": [
+            {"id": "file.read", "label": "Browse and read files"},
+            {"id": "file.create", "label": "Create files and folders"},
+            {"id": "file.update", "label": "Edit files and rename entries"},
+            {"id": "file.delete", "label": "Delete files and folders"},
+            {"id": "file.upload", "label": "Upload files"},
+            {"id": "file.download", "label": "Download files"},
+            {"id": "file.archive", "label": "Create archives"},
+            {"id": "file.extract", "label": "Extract archives"},
+            {"id": "file.chmod", "label": "Change permissions"},
+        ],
+    },
+    {
+        "group": "Databases",
+        "permissions": [
+            {"id": "database.read", "label": "View databases"},
+            {"id": "database.create", "label": "Create databases"},
+            {"id": "database.delete", "label": "Delete databases"},
+        ],
+    },
+    {
+        "group": "Backups",
+        "permissions": [
+            {"id": "backup.read", "label": "View backups"},
+            {"id": "backup.create", "label": "Create backups"},
+            {"id": "backup.download", "label": "Download backups"},
+            {"id": "backup.restore", "label": "Restore backups"},
+            {"id": "backup.delete", "label": "Delete backups"},
+        ],
+    },
+    {
+        "group": "Schedules",
+        "permissions": [
+            {"id": "schedule.read", "label": "View schedules"},
+            {"id": "schedule.create", "label": "Create schedules"},
+            {"id": "schedule.update", "label": "Edit and run schedules"},
+            {"id": "schedule.delete", "label": "Delete schedules"},
+        ],
+    },
+    {
+        "group": "Network",
+        "permissions": [
+            {"id": "allocation.read", "label": "View allocations"},
+            {"id": "allocation.create", "label": "Assign allocations"},
+            {"id": "allocation.update", "label": "Change the primary allocation"},
+            {"id": "allocation.delete", "label": "Release allocations"},
+        ],
+    },
+    {
+        "group": "Access",
+        "permissions": [
+            {"id": "user.read", "label": "View subusers"},
+            {"id": "user.create", "label": "Invite subusers"},
+            {"id": "user.update", "label": "Change subuser permissions"},
+            {"id": "user.delete", "label": "Remove subusers"},
+        ],
+    },
+    {
+        "group": "Configuration",
+        "permissions": [
+            {"id": "startup.read", "label": "View startup configuration"},
+            {"id": "startup.update", "label": "Change startup configuration"},
+            {"id": "settings.rename", "label": "Rename the server"},
+            {"id": "activity.read", "label": "View server activity"},
+        ],
+    },
+]
+
+ALL_SERVER_PERMISSIONS = [
+    item["id"]
+    for group in SERVER_PERMISSION_GROUPS
+    for item in group["permissions"]
+]
+
+
+def parse_permissions(raw: Any) -> list[str]:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(raw, list):
+        return []
+    allowed = set(ALL_SERVER_PERMISSIONS)
+    out: list[str] = []
+    for item in raw:
+        value = str(item).strip()
+        if value in allowed and value not in out:
+            out.append(value)
+    return out
+
+
+def permissions_for_server(user: dict[str, Any], server_id: str) -> list[str]:
+    if user.get("role") == "admin":
+        return ["*"]
+    with db() as conn:
+        row = conn.execute(
+            "SELECT permissions FROM subusers WHERE server_id = ? AND email = ?",
+            (server_id, user.get("email") or ""),
+        ).fetchone()
+    return parse_permissions(row["permissions"] if row else "[]")
+
+
+def require_server_permission(
+    server: dict[str, Any], user: dict[str, Any], permission: str
+) -> None:
+    if user.get("role") == "admin":
+        return
+    granted = set(server.get("permissions") or [])
+    if "*" in granted or permission in granted:
+        return
+    raise HTTPException(403, f"You do not have permission to perform this action ({permission})")
+
+
+def require_owner_or_admin(server: dict[str, Any], user: dict[str, Any]) -> None:
+    if user.get("role") == "admin" or int(server.get("owner_id") or 0) == int(user.get("id") or 0):
+        return
+    raise HTTPException(403, "Only the server owner or an administrator can do this")
 
 
 def get_server(server_id: str, user: dict[str, Any]) -> dict[str, Any]:
@@ -464,14 +710,19 @@ def get_server(server_id: str, user: dict[str, Any]) -> dict[str, Any]:
     server = row_to_dict(row)
     if not server:
         raise HTTPException(404, "Server not found")
-    if user["role"] != "admin" and server["owner_id"] != user["id"]:
+    is_owner = int(server["owner_id"]) == int(user["id"])
+    if user["role"] != "admin" and not is_owner:
         with db() as conn:
             sub = conn.execute(
-                "SELECT id FROM subusers WHERE server_id = ? AND email = ?",
+                "SELECT permissions FROM subusers WHERE server_id = ? AND email = ?",
                 (server_id, user["email"]),
             ).fetchone()
         if not sub:
             raise HTTPException(403, "You do not have permission to access this server")
+        server["permissions"] = parse_permissions(sub["permissions"])
+    else:
+        server["permissions"] = ["*"]
+    server["is_owner"] = bool(is_owner)
     server["status"] = manager.status_of(server["id"])
     try:
         server["environment"] = json.loads(server.get("environment") or "{}")
@@ -491,6 +742,7 @@ def public_user(user: dict[str, Any]) -> dict[str, Any]:
         "created_at": user.get("created_at"),
         "last_login": user.get("last_login"),
         "root_admin": user.get("role") == "admin",
+        "two_factor_enabled": bool(user.get("totp_enabled")),
     }
 
 
@@ -512,6 +764,41 @@ def note_login_failure(key: str) -> None:
 
 def clear_login_failures(key: str) -> None:
     _LOGIN_FAILURES.pop(key, None)
+
+
+def consume_recovery_code(conn: Any, user_id: int, code: str) -> bool:
+    normalized = hash_recovery_code(code)
+    if not normalized or len(re.sub(r"[^A-Za-z0-9]", "", code or "")) < 6:
+        return False
+    row = conn.execute(
+        """SELECT id FROM user_recovery_codes
+           WHERE user_id = ? AND code_hash = ? AND used_at IS NULL""",
+        (user_id, normalized),
+    ).fetchone()
+    if not row:
+        return False
+    conn.execute(
+        "UPDATE user_recovery_codes SET used_at = ? WHERE id = ?", (utcnow(), row["id"])
+    )
+    return True
+
+
+def two_factor_challenge_payload(user: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "two_factor_required": True,
+        "challenge": sign_token({"uid": user["id"], "typ": "2fa"}, 300),
+        "expires_in": 300,
+    }
+
+
+def finalize_login(user: dict[str, Any]) -> dict[str, Any]:
+    stamp = utcnow()
+    with db() as conn:
+        conn.execute("UPDATE users SET last_login = ? WHERE id = ?", (stamp, user["id"]))
+    user["last_login"] = stamp
+    token = sign_token({"uid": user["id"], "role": user["role"], "usr": user["username"]})
+    log_activity(user["id"], None, "auth:login")
+    return {"token": token, "user": public_user(user)}
 
 
 def reject_suspended(server: dict[str, Any]) -> None:
@@ -566,6 +853,8 @@ def terminal_relative(path: Path, root: Path) -> str:
     try:
         rel = path.resolve().relative_to(root)
     except (ValueError, OSError):
+        return "/"
+    if not rel.parts:
         return "/"
     value = rel.as_posix().strip("/")
     return "/" + value if value else "/"
@@ -644,7 +933,10 @@ async def sudo_ready() -> tuple[bool, str]:
         proc = await asyncio.create_subprocess_exec(
             "sudo",
             "-n",
-            "true",
+            "--",
+            "bash",
+            "-c",
+            "exit 0",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -1763,8 +2055,17 @@ def decorate_server(server: dict[str, Any]) -> dict[str, Any]:
             "io": server.get("io"),
         },
         "resources": stats,
-        "feature_limits": {"databases": 2, "allocations": 1, "backups": 8},
+        "feature_limits": {"databases": SERVER_DATABASE_LIMIT, "allocations": 1, "backups": 8},
     }
+
+
+def redact_server_payload(server: dict[str, Any]) -> dict[str, Any]:
+    permissions = set(server.get("permissions") or [])
+    if "*" in permissions or "startup.read" in permissions:
+        return server
+    server.pop("environment", None)
+    server.pop("startup", None)
+    return server
 
 
 def safe_join(server_id: str, rel: str) -> Path:
@@ -1782,6 +2083,7 @@ async def on_startup() -> None:
     init_db()
     await seed_demo_servers()
     asyncio.create_task(schedule_loop())
+    threading.Thread(target=warm_system_caches, daemon=True, name="system-health-warmup").start()
 
 
 async def seed_demo_servers() -> None:
@@ -1989,6 +2291,8 @@ async def run_due_schedules() -> None:
     now = datetime.now(timezone.utc)
     with db() as conn:
         rows = rows_to_list(conn.execute("SELECT * FROM schedules WHERE enabled = 1").fetchall())
+        for sch in rows:
+            schedule_payload(conn, sch)
     for sch in rows:
         expr = sch.get("cron") or "*/5 * * * *"
         last_run = _parse_utc(sch.get("last_run"))
@@ -2020,19 +2324,83 @@ async def run_due_schedules() -> None:
                     (schedule_next_run(expr, now), sch["id"]),
                 )
             continue
-        try:
-            await execute_schedule_action(server, sch)
-        except Exception:
-            pass
         with db() as conn:
             conn.execute(
                 "UPDATE schedules SET last_run = ?, next_run = ? WHERE id = ?",
                 (utcnow(), schedule_next_run(expr, now), sch["id"]),
             )
+        asyncio.create_task(run_schedule_background(sch, server))
 
 
-async def execute_schedule_action(server: dict[str, Any], sch: dict[str, Any]) -> None:
-    action = sch["action"]
+async def run_schedule_background(sch: dict[str, Any], server: dict[str, Any]) -> None:
+    schedule_id = int(sch["id"])
+    if schedule_id in _RUNNING_SCHEDULES:
+        return
+    _RUNNING_SCHEDULES.add(schedule_id)
+    try:
+        await execute_schedule(server, sch)
+    except Exception as exc:
+        log_activity(
+            None,
+            server["id"],
+            "schedule:failed",
+            {"schedule": sch.get("name"), "error": str(exc)[:300]},
+        )
+    finally:
+        _RUNNING_SCHEDULES.discard(schedule_id)
+
+
+async def execute_schedule(server: dict[str, Any], sch: dict[str, Any]) -> list[dict[str, Any]]:
+    tasks = sch.get("tasks") or []
+    if not tasks and sch.get("action"):
+        tasks = [
+            {
+                "action": sch["action"],
+                "payload": sch.get("payload") or "",
+                "time_offset": 0,
+                "continue_on_failure": 1,
+            }
+        ]
+    results: list[dict[str, Any]] = []
+    for task in tasks:
+        offset = max(0, min(int(task.get("time_offset") or 0), 3600))
+        if offset:
+            await asyncio.sleep(offset)
+        action = str(task.get("action") or "")
+        try:
+            await execute_schedule_task(server, sch, task)
+            results.append({"action": action, "status": "completed", "payload": task.get("payload") or ""})
+        except Exception as exc:
+            results.append(
+                {
+                    "action": action,
+                    "status": "failed",
+                    "payload": task.get("payload") or "",
+                    "error": str(exc)[:300],
+                }
+            )
+            log_activity(
+                None,
+                server["id"],
+                "schedule:task-failed",
+                {"schedule": sch.get("name"), "action": action, "error": str(exc)[:300]},
+            )
+            if not task.get("continue_on_failure", 1):
+                break
+    log_activity(
+        None,
+        server["id"],
+        "schedule:execute",
+        {"schedule": sch.get("name"), "results": results},
+    )
+    return results
+
+
+async def execute_schedule_task(
+    server: dict[str, Any], sch: dict[str, Any], task: dict[str, Any]
+) -> None:
+    action = str(task.get("action") or "")
+    payload = str(task.get("payload") or "").strip()
     inst = manager.get(server)
     if action == "start":
         await inst.start()
@@ -2044,9 +2412,26 @@ async def execute_schedule_action(server: dict[str, Any], sch: dict[str, Any]) -
     elif action == "kill":
         await inst.stop(kill=True)
     elif action == "backup":
-        create_backup_file(server, name=f"schedule-{sch['name']}")
-    elif action == "command" and sch.get("payload"):
-        await inst.send(sch["payload"])
+        create_backup_file(server, name=payload or f"schedule-{sch['name']}")
+    elif action == "command":
+        if not payload:
+            raise ValueError("A console command is required")
+        await inst.send(payload)
+    elif action == "delete_files":
+        if not payload:
+            raise ValueError("A path is required")
+        target = safe_join(server["id"], payload)
+        root = (SERVERS_DIR / server["id"]).resolve()
+        if target == root:
+            raise ValueError("Refusing to delete the server root")
+        if not target.exists():
+            raise ValueError("The selected path does not exist")
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+    else:
+        raise ValueError(f"Unsupported schedule action: {action}")
 
 
 @app.get("/api/system")
@@ -2083,13 +2468,46 @@ def login(body: LoginBody, request: Request) -> dict[str, Any]:
         note_login_failure(rate_key)
         raise HTTPException(401, "Invalid username or password")
     clear_login_failures(rate_key)
-    stamp = utcnow()
+    if user.get("totp_enabled"):
+        return two_factor_challenge_payload(user)
+    return finalize_login(user)
+
+
+@app.post("/api/auth/2fa")
+def login_two_factor(body: TwoFactorLoginBody, request: Request) -> dict[str, Any]:
+    payload = decode_token(body.challenge)
+    if not payload or payload.get("typ") != "2fa" or not payload.get("uid"):
+        raise HTTPException(401, "This sign-in challenge has expired. Sign in again.")
+    uid = int(payload["uid"])
+    rate_key = f"2fa:{request.client.host if request.client else '-'}:{uid}"
+    if login_rate_limited(rate_key):
+        raise HTTPException(429, "Too many authentication attempts. Try again in a few minutes.")
     with db() as conn:
-        conn.execute("UPDATE users SET last_login = ? WHERE id = ?", (stamp, user["id"]))
-    user["last_login"] = stamp
-    token = sign_token({"uid": user["id"], "role": user["role"], "usr": user["username"]})
-    log_activity(user["id"], None, "auth:login")
-    return {"token": token, "user": public_user(user)}
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
+    user = row_to_dict(row)
+    if not user or not user.get("totp_enabled"):
+        raise HTTPException(401, "Two-factor authentication is not active for this account")
+    code = (body.code or "").strip()
+    valid, step = verify_totp(
+        str(user.get("totp_secret") or ""), code, last_step=int(user.get("totp_last_step") or 0)
+    )
+    recovery_used = False
+    if not valid:
+        with db() as conn:
+            recovery_used = consume_recovery_code(conn, uid, code)
+    if not valid and not recovery_used:
+        note_login_failure(rate_key)
+        raise HTTPException(401, "That authentication code is not valid")
+    clear_login_failures(rate_key)
+    if step:
+        with db() as conn:
+            conn.execute(
+                "UPDATE users SET totp_last_step = ? WHERE id = ? AND totp_last_step < ?",
+                (step, uid, step),
+            )
+    if recovery_used:
+        log_activity(uid, None, "auth:2fa-recovery")
+    return finalize_login(user)
 
 
 @app.get("/api/auth/me")
@@ -2108,6 +2526,123 @@ def change_password(body: PasswordBody, user: dict[str, Any] = Depends(user_from
             "UPDATE users SET password_hash = ? WHERE id = ?",
             (hash_password(body.new_password), user["id"]),
         )
+    return {"status": "ok"}
+
+
+@app.get("/api/account/2fa")
+def two_factor_status(user: dict[str, Any] = Depends(user_from_header)) -> dict[str, Any]:
+    with db() as conn:
+        current = row_to_dict(
+            conn.execute(
+                "SELECT totp_enabled FROM users WHERE id = ?", (user["id"],)
+            ).fetchone()
+        )
+        remaining = conn.execute(
+            """SELECT COUNT(*) AS c FROM user_recovery_codes
+               WHERE user_id = ? AND used_at IS NULL""",
+            (user["id"],),
+        ).fetchone()["c"]
+    return {
+        "enabled": bool((current or {}).get("totp_enabled")),
+        "recovery_codes_remaining": int(remaining),
+        "issuer": PANEL_NAME,
+        "digits": 6,
+        "period": 30,
+    }
+
+
+@app.post("/api/account/2fa/setup")
+def two_factor_setup(
+    body: TwoFactorSetupBody, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, Any]:
+    with db() as conn:
+        current = row_to_dict(
+            conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+        )
+        if not current:
+            raise HTTPException(404, "Account not found")
+        if current.get("totp_enabled"):
+            raise HTTPException(400, "Two-factor authentication is already enabled")
+        if not verify_password(body.password or "", current["password_hash"]):
+            raise HTTPException(400, "Your account password is incorrect")
+        secret = generate_totp_secret()
+        conn.execute(
+            "UPDATE users SET totp_secret = ?, totp_last_step = 0 WHERE id = ?",
+            (secret, user["id"]),
+        )
+    log_activity(user["id"], None, "account:2fa-setup")
+    return {
+        "secret": secret,
+        "otpauth_uri": otpauth_uri(secret, current["email"], PANEL_NAME),
+        "issuer": PANEL_NAME,
+        "account": current["email"],
+        "digits": 6,
+        "period": 30,
+    }
+
+
+@app.post("/api/account/2fa/enable")
+def two_factor_enable(
+    body: TwoFactorCodeBody, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, Any]:
+    with db() as conn:
+        current = row_to_dict(
+            conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+        )
+        if not current:
+            raise HTTPException(404, "Account not found")
+        if current.get("totp_enabled"):
+            raise HTTPException(400, "Two-factor authentication is already enabled")
+        secret = str(current.get("totp_secret") or "")
+        if not secret:
+            raise HTTPException(400, "Start the two-factor setup again to generate a secret")
+        valid, step = verify_totp(secret, body.code)
+        if not valid:
+            raise HTTPException(400, "That authentication code is not valid")
+        raw_codes = [generate_recovery_code() for _ in range(10)]
+        conn.execute("DELETE FROM user_recovery_codes WHERE user_id = ?", (user["id"],))
+        for code in raw_codes:
+            conn.execute(
+                """INSERT INTO user_recovery_codes (user_id, code_hash, created_at)
+                   VALUES (?, ?, ?)""",
+                (user["id"], hash_recovery_code(code), utcnow()),
+            )
+        conn.execute(
+            "UPDATE users SET totp_enabled = 1, totp_last_step = ? WHERE id = ?",
+            (step, user["id"]),
+        )
+    log_activity(user["id"], None, "account:2fa-enable")
+    return {"status": "ok", "recovery_codes": raw_codes}
+
+
+@app.post("/api/account/2fa/disable")
+def two_factor_disable(
+    body: TwoFactorDisableBody, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, str]:
+    with db() as conn:
+        current = row_to_dict(
+            conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+        )
+        if not current:
+            raise HTTPException(404, "Account not found")
+        if not current.get("totp_enabled"):
+            raise HTTPException(400, "Two-factor authentication is not enabled")
+        if not verify_password(body.password or "", current["password_hash"]):
+            raise HTTPException(400, "Your account password is incorrect")
+        valid, _ = verify_totp(
+            str(current.get("totp_secret") or ""),
+            body.code,
+            last_step=int(current.get("totp_last_step") or 0),
+        )
+        if not valid and not consume_recovery_code(conn, user["id"], body.code):
+            raise HTTPException(400, "Provide a valid authenticator or recovery code")
+        conn.execute(
+            """UPDATE users SET totp_enabled = 0, totp_secret = '',
+                      totp_last_step = 0 WHERE id = ?""",
+            (user["id"],),
+        )
+        conn.execute("DELETE FROM user_recovery_codes WHERE user_id = ?", (user["id"],))
+    log_activity(user["id"], None, "account:2fa-disable")
     return {"status": "ok"}
 
 
@@ -2228,13 +2763,32 @@ def list_servers(user: dict[str, Any] = Depends(user_from_header)) -> dict[str, 
                    ORDER BY s.name COLLATE NOCASE""",
                 (user["id"], user["email"]),
             ).fetchall()
-    data = [decorate_server(row_to_dict(r) or {}) for r in rows]
+    rows = rows_to_list(rows)
+    if user["role"] == "admin":
+        granted: dict[str, list[str]] = {}
+        for row in rows:
+            row["permissions"] = ["*"]
+            row["is_owner"] = False
+    else:
+        with db() as conn:
+            sub_rows = conn.execute(
+                "SELECT server_id, permissions FROM subusers WHERE email = ?",
+                (user["email"],),
+            ).fetchall()
+        granted = {
+            sub["server_id"]: parse_permissions(sub["permissions"]) for sub in sub_rows
+        }
+        for row in rows:
+            owner = int(row.get("owner_id") or 0) == int(user["id"])
+            row["is_owner"] = owner
+            row["permissions"] = ["*"] if owner else granted.get(row["id"], [])
+    data = [redact_server_payload(decorate_server(row)) for row in rows]
     return {"data": data}
 
 
 @app.get("/api/servers/{server_id}")
 def show_server(server_id: str, user: dict[str, Any] = Depends(user_from_header)) -> dict[str, Any]:
-    return {"data": decorate_server(get_server(server_id, user))}
+    return {"data": redact_server_payload(decorate_server(get_server(server_id, user)))}
 
 
 @app.get("/api/servers/{server_id}/terminal")
@@ -2288,6 +2842,7 @@ async def server_terminal_sudo(
 @app.get("/api/servers/{server_id}/resources")
 def server_resources(server_id: str, user: dict[str, Any] = Depends(user_from_header)) -> dict[str, Any]:
     server = get_server(server_id, user)
+    require_server_permission(server, user, "websocket.connect")
     inst = manager.get(server)
     return {"data": inst.stats()}
 
@@ -2300,6 +2855,9 @@ async def server_power(
     reject_suspended(server)
     inst = manager.get(server)
     sig = body.signal.lower().strip()
+    if sig not in ("start", "stop", "restart", "kill"):
+        raise HTTPException(400, "Unknown power signal")
+    require_server_permission(server, user, f"control.{sig}")
     log_activity(user["id"], server_id, f"server:power:{sig}")
     if sig == "start":
         await inst.start()
@@ -2310,8 +2868,6 @@ async def server_power(
         await inst.start()
     elif sig == "kill":
         await inst.stop(kill=True)
-    else:
-        raise HTTPException(400, "Unknown power signal")
     with db() as conn:
         conn.execute("UPDATE servers SET status = ? WHERE id = ?", (inst.status, server_id))
     return {"status": inst.status}
@@ -2323,6 +2879,7 @@ async def server_command(
 ) -> dict[str, str]:
     server = get_server(server_id, user)
     reject_suspended(server)
+    require_server_permission(server, user, "control.console")
     inst = manager.get(server)
     await inst.send(body.command)
     return {"status": "ok"}
@@ -2330,7 +2887,8 @@ async def server_command(
 
 @app.get("/api/servers/{server_id}/activity")
 def server_activity(server_id: str, user: dict[str, Any] = Depends(user_from_header)) -> dict[str, Any]:
-    get_server(server_id, user)
+    server = get_server(server_id, user)
+    require_server_permission(server, user, "activity.read")
     with db() as conn:
         rows = conn.execute(
             """SELECT a.*, u.username FROM activity a
@@ -2386,7 +2944,8 @@ def list_files(
     directory: str = Query("/"),
     user: dict[str, Any] = Depends(user_from_header),
 ) -> dict[str, Any]:
-    get_server(server_id, user)
+    server = get_server(server_id, user)
+    require_server_permission(server, user, "file.read")
     path = safe_join(server_id, directory)
     if not path.exists():
         raise HTTPException(404, "Directory not found")
@@ -2417,7 +2976,8 @@ def list_files(
 def file_contents(
     server_id: str, file: str = Query(...), user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, Any]:
-    get_server(server_id, user)
+    server = get_server(server_id, user)
+    require_server_permission(server, user, "file.read")
     path = safe_join(server_id, file)
     if not path.is_file():
         raise HTTPException(404, "File not found")
@@ -2434,7 +2994,9 @@ def file_contents(
 def file_save(
     server_id: str, body: FileSaveBody, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, str]:
-    reject_suspended(get_server(server_id, user))
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    require_server_permission(server, user, "file.update")
     path = safe_join(server_id, body.file)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body.contents, encoding="utf-8")
@@ -2446,7 +3008,9 @@ def file_save(
 def file_create(
     server_id: str, body: FileCreateBody, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, str]:
-    reject_suspended(get_server(server_id, user))
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    require_server_permission(server, user, "file.create")
     path = safe_join(server_id, str(Path(body.root) / body.name))
     if body.directory:
         path.mkdir(parents=True, exist_ok=True)
@@ -2460,7 +3024,9 @@ def file_create(
 def file_rename(
     server_id: str, body: FileRenameBody, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, str]:
-    reject_suspended(get_server(server_id, user))
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    require_server_permission(server, user, "file.update")
     src = safe_join(server_id, str(Path(body.root) / body.from_name))
     dst = safe_join(server_id, str(Path(body.root) / body.to_name))
     if not src.exists():
@@ -2473,13 +3039,177 @@ def file_rename(
 def file_delete(
     server_id: str, body: FileDeleteBody, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, str]:
-    reject_suspended(get_server(server_id, user))
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    require_server_permission(server, user, "file.delete")
     for name in body.files:
         path = safe_join(server_id, str(Path(body.root) / name))
         if path.is_dir():
             shutil.rmtree(path)
         elif path.exists():
             path.unlink()
+    return {"status": "ok"}
+
+
+@app.post("/api/servers/{server_id}/files/compress")
+def file_compress(
+    server_id: str, body: FileCompressBody, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    require_server_permission(server, user, "file.archive")
+    root = safe_join(server_id, body.root)
+    if not root.is_dir():
+        raise HTTPException(400, "The selected directory is not valid")
+    name = (body.name or "").strip() or "archive"
+    if Path(name).name != name:
+        raise HTTPException(400, "Archive names cannot contain path separators")
+    lower = name.lower()
+    if not lower.endswith((".zip", ".tar.gz", ".tgz")):
+        name += ".zip"
+        lower = name.lower()
+    destination = root / name
+    if destination.exists():
+        raise HTTPException(400, "An entry with that archive name already exists")
+    sources: list[Path] = []
+    for raw in body.files:
+        candidate = safe_join(server_id, str(Path(body.root) / raw))
+        if candidate == Path(SERVERS_DIR / server_id).resolve():
+            raise HTTPException(400, "The server root cannot be archived as a single entry")
+        if candidate.exists():
+            sources.append(candidate)
+    if not sources:
+        raise HTTPException(400, "Select at least one existing file or folder")
+    if lower.endswith(".zip"):
+        with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for source in sources:
+                if source.is_dir():
+                    for child in sorted(source.rglob("*")):
+                        if child.is_file():
+                            archive.write(child, child.relative_to(root).as_posix())
+                else:
+                    archive.write(source, source.relative_to(root).as_posix())
+    else:
+        with tarfile.open(destination, "w:gz") as archive:
+            for source in sources:
+                archive.add(source, arcname=source.relative_to(root).as_posix())
+    log_activity(
+        user["id"],
+        server_id,
+        "file:compress",
+        {"name": name, "entries": len(sources)},
+    )
+    return {"status": "ok", "name": name, "bytes": destination.stat().st_size}
+
+
+@app.post("/api/servers/{server_id}/files/extract")
+def file_extract(
+    server_id: str, body: FileExtractBody, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    require_server_permission(server, user, "file.extract")
+    source = safe_join(server_id, body.file)
+    if not source.is_file():
+        raise HTTPException(404, "Archive not found")
+    default_destination = source.parent.relative_to(Path(SERVERS_DIR / server_id).resolve())
+    destination = safe_join(
+        server_id, body.destination.strip() or default_destination.as_posix()
+    )
+    destination.mkdir(parents=True, exist_ok=True)
+    lower = source.name.lower()
+    extracted = 0
+    if lower.endswith(".zip"):
+        with zipfile.ZipFile(source) as archive:
+            for info in archive.infolist():
+                relative = Path(info.filename)
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise HTTPException(400, "Archive contains an unsafe path")
+                target = (destination / relative).resolve()
+                if destination not in target.parents and target != destination:
+                    raise HTTPException(400, "Archive contains an unsafe path")
+                if info.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(info) as src, target.open("wb") as out:
+                    shutil.copyfileobj(src, out)
+                extracted += 1
+    elif lower.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")):
+        with tarfile.open(source, "r:*") as archive:
+            for member in archive.getmembers():
+                relative = Path(member.name)
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise HTTPException(400, "Archive contains an unsafe path")
+                target = (destination / relative).resolve()
+                if destination not in target.parents and target != destination:
+                    raise HTTPException(400, "Archive contains an unsafe path")
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                if not member.isfile():
+                    continue
+                handle = archive.extractfile(member)
+                if handle is None:
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with handle, target.open("wb") as out:
+                    shutil.copyfileobj(handle, out)
+                extracted += 1
+    else:
+        raise HTTPException(400, "Supported archives are zip, tar, tar.gz, tgz, tar.bz2 and tar.xz")
+    log_activity(
+        user["id"],
+        server_id,
+        "file:extract",
+        {"file": body.file, "destination": body.destination, "entries": extracted},
+    )
+    return {"status": "ok", "entries": extracted}
+
+
+@app.post("/api/servers/{server_id}/files/chmod")
+def file_chmod(
+    server_id: str, body: FileChmodBody, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    require_server_permission(server, user, "file.chmod")
+    mode = (body.mode or "").strip()
+    if not re.fullmatch(r"[0-7]{3,4}", mode):
+        raise HTTPException(400, "Permissions must be an octal mode such as 644 or 0755")
+    changed = 0
+    for raw in body.files:
+        target = safe_join(server_id, str(Path(body.root) / raw))
+        if not target.exists():
+            continue
+        try:
+            os.chmod(target, int(mode, 8))
+        except OSError as exc:
+            raise HTTPException(400, f"Unable to change permissions for {raw}: {exc}") from exc
+        changed += 1
+    log_activity(user["id"], server_id, "file:chmod", {"mode": mode, "entries": changed})
+    return {"status": "ok", "changed": changed}
+
+
+@app.post("/api/servers/{server_id}/files/copy")
+def file_copy(
+    server_id: str, body: FileCopyBody, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, str]:
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    require_server_permission(server, user, "file.create")
+    source = safe_join(server_id, str(Path(body.root) / body.from_name))
+    destination = safe_join(server_id, str(Path(body.root) / body.to_name))
+    if not source.exists():
+        raise HTTPException(404, "Source not found")
+    if destination.exists():
+        raise HTTPException(400, "Destination already exists")
+    if source.is_dir():
+        shutil.copytree(source, destination)
+    else:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    log_activity(user["id"], server_id, "file:copy", {"from": body.from_name, "to": body.to_name})
     return {"status": "ok"}
 
 
@@ -2490,7 +3220,9 @@ async def file_upload(
     upload: UploadFile = File(...),
     user: dict[str, Any] = Depends(user_from_header),
 ) -> dict[str, str]:
-    reject_suspended(get_server(server_id, user))
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    require_server_permission(server, user, "file.upload")
     dest_dir = safe_join(server_id, directory)
     dest_dir.mkdir(parents=True, exist_ok=True)
     name = Path(upload.filename or "upload.bin").name
@@ -2504,7 +3236,8 @@ async def file_upload(
 def file_download(
     server_id: str, file: str = Query(...), user: dict[str, Any] = Depends(user_from_header)
 ) -> FileResponse:
-    get_server(server_id, user)
+    server = get_server(server_id, user)
+    require_server_permission(server, user, "file.download")
     path = safe_join(server_id, file)
     if not path.is_file():
         raise HTTPException(404, "File not found")
@@ -2514,14 +3247,9 @@ def file_download(
 @app.get("/api/servers/{server_id}/startup")
 def get_startup(server_id: str, user: dict[str, Any] = Depends(user_from_header)) -> dict[str, Any]:
     server = get_server(server_id, user)
-    with db() as conn:
-        egg = row_to_dict(conn.execute("SELECT * FROM eggs WHERE id = ?", (server["egg_id"],)).fetchone())
-    variables = []
-    if egg:
-        try:
-            variables = json.loads(egg.get("variables") or "[]")
-        except json.JSONDecodeError:
-            variables = []
+    require_server_permission(server, user, "startup.read")
+    egg = resolve_egg(int(server["egg_id"]))
+    variables = egg.get("variables") if egg else []
     return {
         "data": {
             "startup": server["startup"],
@@ -2538,6 +3266,7 @@ def put_startup(
     server_id: str, body: StartupBody, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, str]:
     server = get_server(server_id, user)
+    require_server_permission(server, user, "startup.update")
     env = server.get("environment") or {}
     if body.environment is not None:
         env.update(body.environment)
@@ -2556,6 +3285,7 @@ def put_settings(
     server_id: str, body: SettingsBody, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, str]:
     server = get_server(server_id, user)
+    require_server_permission(server, user, "settings.rename")
     name = body.name if body.name is not None else server["name"]
     desc = body.description if body.description is not None else server["description"]
     image = body.image if body.image is not None else server["image"]
@@ -2581,6 +3311,7 @@ def put_settings(
 def reinstall(server_id: str, user: dict[str, Any] = Depends(user_from_header)) -> dict[str, str]:
     server = get_server(server_id, user)
     reject_suspended(server)
+    require_owner_or_admin(server, user)
     env = {
         "SERVER_NAME": server["name"],
         "SERVER_PORT": str(server["allocation_port"]),
@@ -2622,6 +3353,7 @@ def server_minecraft(
     server_id: str, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, Any]:
     server = get_server(server_id, user)
+    require_server_permission(server, user, "file.read")
     return {"data": _server_mc_payload(server)}
 
 
@@ -2630,6 +3362,7 @@ async def server_minecraft_status(
     server_id: str, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, Any]:
     server = get_server(server_id, user)
+    require_server_permission(server, user, "file.read")
     software_id = _server_mc_software(server)
     if not software_id:
         raise HTTPException(400, "This server is not a Minecraft workload")
@@ -2662,6 +3395,7 @@ async def server_minecraft_install(
 ) -> dict[str, Any]:
     server = get_server(server_id, user)
     reject_suspended(server)
+    require_server_permission(server, user, "startup.update")
     current = _server_mc_software(server)
     try:
         config = _mc_config(
@@ -2699,7 +3433,8 @@ def server_minecraft_job(
     job_id: str,
     user: dict[str, Any] = Depends(user_from_header),
 ) -> dict[str, Any]:
-    get_server(server_id, user)
+    server = get_server(server_id, user)
+    require_server_permission(server, user, "file.read")
     job = _mc_job_snapshot(job_id)
     if not job or job.get("server_id") != server_id:
         raise HTTPException(404, "Installation job not found")
@@ -2711,6 +3446,7 @@ async def server_minecraft_update(
     server_id: str, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, Any]:
     server = get_server(server_id, user)
+    require_server_permission(server, user, "startup.read")
     software_id = _server_mc_software(server)
     if not software_id:
         raise HTTPException(400, "This server is not a Minecraft workload")
@@ -2734,6 +3470,7 @@ async def server_minecraft_upgrade(
 ) -> dict[str, Any]:
     server = get_server(server_id, user)
     reject_suspended(server)
+    require_server_permission(server, user, "startup.update")
     software_id = _server_mc_software(server)
     if not software_id:
         raise HTTPException(400, "This server is not a Minecraft workload")
@@ -2802,6 +3539,7 @@ def server_minecraft_properties(
 ) -> dict[str, Any]:
     server = get_server(server_id, user)
     reject_suspended(server)
+    require_server_permission(server, user, "file.update")
     software_id = _server_mc_software(server)
     if not software_id:
         raise HTTPException(400, "This server is not a Minecraft workload")
@@ -2826,6 +3564,7 @@ def server_plugins(
     server_id: str, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, Any]:
     server = get_server(server_id, user)
+    require_server_permission(server, user, "file.read")
     software_id = _server_mc_software(server)
     if not software_id:
         return {
@@ -2855,6 +3594,7 @@ def server_plugins_search(
     user: dict[str, Any] = Depends(user_from_header),
 ) -> dict[str, Any]:
     server = get_server(server_id, user)
+    require_server_permission(server, user, "file.read")
     software_id = _server_mc_software(server)
     if not software_id:
         raise HTTPException(400, "This server is not a Minecraft workload")
@@ -2880,6 +3620,7 @@ def server_plugin_versions(
     user: dict[str, Any] = Depends(user_from_header),
 ) -> dict[str, Any]:
     server = get_server(server_id, user)
+    require_server_permission(server, user, "file.read")
     software_id = _server_mc_software(server)
     if not software_id:
         raise HTTPException(400, "This server is not a Minecraft workload")
@@ -2902,6 +3643,7 @@ async def server_plugin_install(
 ) -> dict[str, Any]:
     server = get_server(server_id, user)
     reject_suspended(server)
+    require_server_permission(server, user, "file.update")
     software_id = _server_mc_software(server)
     if not software_id:
         raise HTTPException(400, "This server is not a Minecraft workload")
@@ -2934,6 +3676,7 @@ async def server_plugin_updates(
     server_id: str, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, Any]:
     server = get_server(server_id, user)
+    require_server_permission(server, user, "file.read")
     software_id = _server_mc_software(server)
     if not software_id:
         raise HTTPException(400, "This server is not a Minecraft workload")
@@ -2997,6 +3740,7 @@ async def server_plugin_update(
 ) -> dict[str, Any]:
     server = get_server(server_id, user)
     reject_suspended(server)
+    require_server_permission(server, user, "file.update")
     software_id = _server_mc_software(server)
     if not software_id:
         raise HTTPException(400, "This server is not a Minecraft workload")
@@ -3084,6 +3828,7 @@ async def server_plugin_upload(
 ) -> dict[str, Any]:
     server = get_server(server_id, user)
     reject_suspended(server)
+    require_server_permission(server, user, "file.upload")
     software_id = _server_mc_software(server)
     if not software_id:
         raise HTTPException(400, "This server is not a Minecraft workload")
@@ -3144,6 +3889,7 @@ def server_plugin_toggle(
 ) -> dict[str, Any]:
     server = get_server(server_id, user)
     reject_suspended(server)
+    require_server_permission(server, user, "file.update")
     software_id = _server_mc_software(server)
     if not software_id:
         raise HTTPException(400, "This server is not a Minecraft workload")
@@ -3171,6 +3917,7 @@ def server_plugin_delete(
 ) -> dict[str, str]:
     server = get_server(server_id, user)
     reject_suspended(server)
+    require_server_permission(server, user, "file.delete")
     software_id = _server_mc_software(server)
     if not software_id:
         raise HTTPException(400, "This server is not a Minecraft workload")
@@ -3192,33 +3939,217 @@ def server_plugin_delete(
     return {"status": "ok"}
 
 
+# ---------------------------------------------------------------------------
+# Database hosts and provisioning
+# ---------------------------------------------------------------------------
+
+SERVER_DATABASE_LIMIT = 5
+
+
+def mysql_client() -> str | None:
+    return shutil.which("mariadb") or shutil.which("mysql")
+
+
+def mysql_ident(value: str, limit: int = 64) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_]", "_", (value or "").strip())[:limit].strip("_")
+    return cleaned or "database"
+
+
+def mysql_execute(host: dict[str, Any], sql: str, database: str | None = None) -> str:
+    client = mysql_client()
+    if not client:
+        raise HTTPException(
+            503,
+            "No MySQL or MariaDB client is installed on the panel host. "
+            "Install mariadb-client (Debian/Ubuntu) to provision remote databases.",
+        )
+    command = [
+        client,
+        "--protocol=TCP",
+        "--connect-timeout=8",
+        "-h",
+        str(host["host"]),
+        "-P",
+        str(int(host["port"])),
+        "-u",
+        str(host["username"]),
+        "-N",
+        "-B",
+    ]
+    if database:
+        command.append(database)
+    command += ["-e", sql]
+    environment = os.environ.copy()
+    environment["MYSQL_PWD"] = str(host["password"])
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=40,
+            env=environment,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(502, f"Database host is unreachable: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown error").strip().splitlines()
+        raise HTTPException(502, f"Database host rejected the request: {detail[-1][:300] if detail else 'unknown error'}")
+    return result.stdout.strip()
+
+
+def database_host(host_id: int) -> dict[str, Any] | None:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM database_hosts WHERE id = ?", (host_id,)).fetchone()
+    return row_to_dict(row)
+
+
+def provision_mysql_database(
+    host: dict[str, Any], dbname: str, username: str, password: str
+) -> None:
+    safe_db = mysql_ident(dbname)
+    safe_user = mysql_ident(username, 32)
+    client_host = str(host.get("linked_ip") or "%").strip() or "%"
+    if not re.fullmatch(r"[A-Za-z0-9_.:%-]+", client_host):
+        client_host = "%"
+    sql = (
+        f"CREATE DATABASE `{safe_db}`;"
+        f"CREATE USER '{safe_user}'@'{client_host}' IDENTIFIED BY '{password}';"
+        f"GRANT ALL PRIVILEGES ON `{safe_db}`.* TO '{safe_user}'@'{client_host}';"
+        "FLUSH PRIVILEGES;"
+    )
+    mysql_execute(host, sql)
+
+
+def drop_mysql_database(host: dict[str, Any], dbname: str, username: str) -> None:
+    safe_db = mysql_ident(dbname)
+    safe_user = mysql_ident(username, 32)
+    client_host = str(host.get("linked_ip") or "%").strip() or "%"
+    if not re.fullmatch(r"[A-Za-z0-9_.:%-]+", client_host):
+        client_host = "%"
+    mysql_execute(
+        host,
+        f"DROP DATABASE IF EXISTS `{safe_db}`; DROP USER IF EXISTS '{safe_user}'@'{client_host}'; FLUSH PRIVILEGES;",
+    )
+
+
 @app.get("/api/servers/{server_id}/databases")
 def list_databases(server_id: str, user: dict[str, Any] = Depends(user_from_header)) -> dict[str, Any]:
-    get_server(server_id, user)
+    server = get_server(server_id, user)
+    require_server_permission(server, user, "database.read")
     with db() as conn:
-        rows = conn.execute("SELECT * FROM databases WHERE server_id = ?", (server_id,)).fetchall()
-    return {"data": rows_to_list(rows)}
+        rows = rows_to_list(
+            conn.execute(
+                """SELECT d.*, h.name AS host_name, h.engine AS host_engine
+                   FROM databases d LEFT JOIN database_hosts h ON h.id = d.host_id
+                   WHERE d.server_id = ? ORDER BY d.id""",
+                (server_id,),
+            ).fetchall()
+        )
+        hosts = rows_to_list(
+            conn.execute(
+                "SELECT id, name, engine, host, port FROM database_hosts ORDER BY name"
+            ).fetchall()
+        )
+    return {
+        "data": rows,
+        "meta": {
+            "hosts": hosts,
+            "limit": SERVER_DATABASE_LIMIT,
+            "client": bool(mysql_client()),
+        },
+    }
 
 
 @app.post("/api/servers/{server_id}/databases")
 def create_database(
     server_id: str, body: DatabaseBody, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, Any]:
-    get_server(server_id, user)
-    username = f"u{server_id[:6]}"
-    password = uuid.uuid4().hex[:16]
-    dbname = "".join(ch for ch in body.name.lower() if ch.isalnum() or ch == "_")[:32] or "sdb"
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    require_server_permission(server, user, "database.create")
+    with db() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) AS c FROM databases WHERE server_id = ?", (server_id,)
+        ).fetchone()["c"]
+        if int(count) >= SERVER_DATABASE_LIMIT:
+            raise HTTPException(400, f"This server has reached its limit of {SERVER_DATABASE_LIMIT} databases")
+        host_row = None
+        if body.engine != "sqlite":
+            if body.host_id:
+                host_row = conn.execute(
+                    "SELECT * FROM database_hosts WHERE id = ?", (body.host_id,)
+                ).fetchone()
+            else:
+                host_row = conn.execute(
+                    "SELECT * FROM database_hosts ORDER BY id LIMIT 1"
+                ).fetchone()
+    selected_host = row_to_dict(host_row)
+    if selected_host:
+        with db() as conn:
+            on_host = conn.execute(
+                "SELECT COUNT(*) AS c FROM databases WHERE host_id = ?", (selected_host["id"],)
+            ).fetchone()["c"]
+        if int(selected_host.get("max_databases") or 0) and int(on_host) >= int(selected_host["max_databases"]):
+            raise HTTPException(
+                400,
+                f"The selected database host has reached its limit of {selected_host['max_databases']} databases",
+            )
+    base = mysql_ident(body.name.lower() or "database", 32)
+    short = str(server.get("short_id") or server_id)[:6]
+    dbname = f"s{short}_{base}"[:64]
+    username = f"u{short}_{secrets.token_hex(3)}"[:32]
+    password = secrets.token_urlsafe(18)
+    if selected_host:
+        try:
+            provision_mysql_database(selected_host, dbname, username, password)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(502, f"Unable to provision database: {exc}") from exc
+        engine = str(selected_host.get("engine") or "mariadb")
+        host_address = str(selected_host["host"])
+        host_port = int(selected_host["port"])
+        host_id = int(selected_host["id"])
+    else:
+        engine = "sqlite"
+        host_address = "127.0.0.1"
+        host_port = 3306
+        host_id = None
     with db() as conn:
         cur = conn.execute(
-            """INSERT INTO databases (server_id, name, username, password, host, port, created_at)
-               VALUES (?, ?, ?, ?, '127.0.0.1', 3306, ?)""",
-            (server_id, dbname, username, password, utcnow()),
+            """INSERT INTO databases
+               (server_id, name, username, password, host, port, host_id, engine, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                server_id,
+                dbname,
+                username,
+                password,
+                host_address,
+                host_port,
+                host_id,
+                engine,
+                utcnow(),
+            ),
         )
         rid = cur.lastrowid
-        row = conn.execute("SELECT * FROM databases WHERE id = ?", (rid,)).fetchone()
-    path = SERVERS_DIR / server_id / ".kestrel" / "db"
-    path.mkdir(parents=True, exist_ok=True)
-    (path / f"{dbname}.sqlite").touch()
+        row = conn.execute(
+            """SELECT d.*, h.name AS host_name, h.engine AS host_engine
+               FROM databases d LEFT JOIN database_hosts h ON h.id = d.host_id
+               WHERE d.id = ?""",
+            (rid,),
+        ).fetchone()
+    if engine == "sqlite":
+        path = SERVERS_DIR / server_id / ".kestrel" / "db"
+        path.mkdir(parents=True, exist_ok=True)
+        (path / f"{dbname}.sqlite").touch()
+    log_activity(
+        user["id"],
+        server_id,
+        "database:create",
+        {"name": dbname, "engine": engine, "host": selected_host.get("name") if selected_host else "local"},
+    )
     return {"data": row_to_dict(row)}
 
 
@@ -3226,24 +4157,40 @@ def create_database(
 def delete_database(
     server_id: str, db_id: int, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, str]:
-    reject_suspended(get_server(server_id, user))
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    require_server_permission(server, user, "database.delete")
     with db() as conn:
         row = conn.execute(
             "SELECT * FROM databases WHERE id = ? AND server_id = ?", (db_id, server_id)
         ).fetchone()
         database = row_to_dict(row)
-        conn.execute("DELETE FROM databases WHERE id = ? AND server_id = ?", (db_id, server_id))
-    if database:
+    if not database:
+        raise HTTPException(404, "Database not found")
+    if database.get("engine") == "sqlite":
         sqlite_file = SERVERS_DIR / server_id / ".kestrel" / "db" / f"{database['name']}.sqlite"
         if sqlite_file.exists():
             sqlite_file.unlink()
-        log_activity(user["id"], server_id, "database:delete", {"name": database["name"]})
+    else:
+        host = database_host(int(database.get("host_id") or 0))
+        if not host:
+            raise HTTPException(409, "The database host for this record no longer exists")
+        drop_mysql_database(host, str(database["name"]), str(database["username"]))
+    with db() as conn:
+        conn.execute("DELETE FROM databases WHERE id = ? AND server_id = ?", (db_id, server_id))
+    log_activity(
+        user["id"],
+        server_id,
+        "database:delete",
+        {"name": database["name"], "engine": database.get("engine")},
+    )
     return {"status": "ok"}
 
 
 @app.get("/api/servers/{server_id}/backups")
 def list_backups(server_id: str, user: dict[str, Any] = Depends(user_from_header)) -> dict[str, Any]:
-    get_server(server_id, user)
+    server = get_server(server_id, user)
+    require_server_permission(server, user, "backup.read")
     with db() as conn:
         rows = conn.execute(
             "SELECT * FROM backups WHERE server_id = ? ORDER BY created_at DESC", (server_id,)
@@ -3280,6 +4227,7 @@ def create_backup_file(server: dict[str, Any], name: str | None = None) -> dict[
 def create_backup(server_id: str, user: dict[str, Any] = Depends(user_from_header)) -> dict[str, Any]:
     server = get_server(server_id, user)
     reject_suspended(server)
+    require_server_permission(server, user, "backup.create")
     data = create_backup_file(server)
     log_activity(user["id"], server_id, "backup:create", {"id": data.get("id")})
     return {"data": data}
@@ -3289,7 +4237,8 @@ def create_backup(server_id: str, user: dict[str, Any] = Depends(user_from_heade
 def download_backup(
     server_id: str, backup_id: str, user: dict[str, Any] = Depends(user_from_header)
 ) -> FileResponse:
-    get_server(server_id, user)
+    server = get_server(server_id, user)
+    require_server_permission(server, user, "backup.download")
     with db() as conn:
         row = conn.execute(
             "SELECT * FROM backups WHERE id = ? AND server_id = ?", (backup_id, server_id)
@@ -3307,7 +4256,8 @@ def download_backup(
 def restore_backup(
     server_id: str, backup_id: str, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, str]:
-    get_server(server_id, user)
+    server = get_server(server_id, user)
+    require_server_permission(server, user, "backup.restore")
     with db() as conn:
         row = conn.execute(
             "SELECT * FROM backups WHERE id = ? AND server_id = ?", (backup_id, server_id)
@@ -3334,7 +4284,8 @@ def restore_backup(
 def delete_backup(
     server_id: str, backup_id: str, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, str]:
-    get_server(server_id, user)
+    server = get_server(server_id, user)
+    require_server_permission(server, user, "backup.delete")
     with db() as conn:
         row = conn.execute(
             "SELECT * FROM backups WHERE id = ? AND server_id = ?", (backup_id, server_id)
@@ -3348,26 +4299,118 @@ def delete_backup(
     return {"status": "ok"}
 
 
+SCHEDULE_ACTIONS = ("start", "stop", "restart", "kill", "backup", "command", "delete_files")
+_RUNNING_SCHEDULES: set[int] = set()
+
+
+def validate_schedule_tasks(body: ScheduleBody) -> list[dict[str, Any]]:
+    raw = list(body.tasks or [])
+    if not raw and body.action:
+        raw = [ScheduleTaskBody(action=body.action, payload=body.payload)]
+    if not raw:
+        raise HTTPException(400, "Add at least one task to the schedule")
+    if len(raw) > 20:
+        raise HTTPException(400, "A schedule can contain at most 20 tasks")
+    tasks: list[dict[str, Any]] = []
+    total_offset = 0
+    for index, task in enumerate(raw):
+        action = (task.action or "").strip()
+        if action not in SCHEDULE_ACTIONS:
+            raise HTTPException(400, f"Unsupported schedule action: {action or '(empty)'}")
+        payload = (task.payload or "").strip()
+        if action == "command" and not payload:
+            raise HTTPException(400, "A console command is required for command tasks")
+        if action == "delete_files" and not payload:
+            raise HTTPException(400, "A path is required for delete-file tasks")
+        offset = max(0, min(int(task.time_offset or 0), 3600))
+        total_offset += offset
+        if total_offset > 7200:
+            raise HTTPException(400, "Combined task delays cannot exceed two hours")
+        tasks.append(
+            {
+                "action": action,
+                "payload": payload,
+                "time_offset": offset,
+                "sequence": index,
+                "continue_on_failure": bool(task.continue_on_failure),
+            }
+        )
+    return tasks
+
+
+def schedule_tasks(conn: Any, schedule: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = rows_to_list(
+        conn.execute(
+            "SELECT * FROM schedule_tasks WHERE schedule_id = ? ORDER BY sequence, id",
+            (schedule["id"],),
+        ).fetchall()
+    )
+    if rows:
+        return rows
+    if schedule.get("action"):
+        return [
+            {
+                "id": 0,
+                "schedule_id": schedule["id"],
+                "action": schedule["action"],
+                "payload": schedule.get("payload") or "",
+                "time_offset": 0,
+                "sequence": 0,
+                "continue_on_failure": 1,
+            }
+        ]
+    return []
+
+
+def replace_schedule_tasks(conn: Any, schedule_id: int, tasks: list[dict[str, Any]]) -> None:
+    conn.execute("DELETE FROM schedule_tasks WHERE schedule_id = ?", (schedule_id,))
+    for task in tasks:
+        conn.execute(
+            """INSERT INTO schedule_tasks
+               (schedule_id, action, payload, time_offset, sequence, continue_on_failure)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                schedule_id,
+                task["action"],
+                task["payload"],
+                task["time_offset"],
+                task["sequence"],
+                1 if task["continue_on_failure"] else 0,
+            ),
+        )
+
+
+def schedule_payload(conn: Any, schedule: dict[str, Any]) -> dict[str, Any]:
+    schedule["tasks"] = schedule_tasks(conn, schedule)
+    schedule["task_count"] = len(schedule["tasks"])
+    return schedule
+
+
 @app.get("/api/servers/{server_id}/schedules")
 def list_schedules(server_id: str, user: dict[str, Any] = Depends(user_from_header)) -> dict[str, Any]:
-    get_server(server_id, user)
+    server = get_server(server_id, user)
+    require_server_permission(server, user, "schedule.read")
     with db() as conn:
-        rows = conn.execute("SELECT * FROM schedules WHERE server_id = ?", (server_id,)).fetchall()
-    return {"data": rows_to_list(rows)}
+        rows = rows_to_list(
+            conn.execute(
+                "SELECT * FROM schedules WHERE server_id = ? ORDER BY id DESC", (server_id,)
+            ).fetchall()
+        )
+        for row in rows:
+            schedule_payload(conn, row)
+    return {"data": rows}
 
 
 @app.post("/api/servers/{server_id}/schedules")
 def create_schedule(
     server_id: str, body: ScheduleBody, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, Any]:
-    get_server(server_id, user)
+    server = get_server(server_id, user)
+    require_server_permission(server, user, "schedule.create")
     name = body.name.strip()
     if not name:
         raise HTTPException(400, "Schedule name is required")
-    if body.action not in ("start", "stop", "restart", "kill", "backup", "command"):
-        raise HTTPException(400, "Unsupported schedule action")
-    if body.action == "command" and not body.payload.strip():
-        raise HTTPException(400, "A console command is required for this action")
+    tasks = validate_schedule_tasks(body)
     expr = body.cron.strip() or "*/5 * * * *"
     if len(expr.split()) != 5:
         raise HTTPException(400, "Cron expressions must contain five fields")
@@ -3380,15 +4423,66 @@ def create_schedule(
                 server_id,
                 name,
                 expr,
-                body.action,
-                body.payload.strip(),
+                tasks[0]["action"],
+                tasks[0]["payload"],
                 1 if body.enabled else 0,
                 next_run,
                 utcnow(),
             ),
         )
-        row = conn.execute("SELECT * FROM schedules WHERE id = ?", (cur.lastrowid,)).fetchone()
-    return {"data": row_to_dict(row)}
+        schedule_id = int(cur.lastrowid)
+        replace_schedule_tasks(conn, schedule_id, tasks)
+        row = row_to_dict(conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone())
+        assert row is not None
+        schedule_payload(conn, row)
+    log_activity(
+        user["id"], server_id, "schedule:create", {"name": name, "tasks": len(tasks)}
+    )
+    return {"data": row}
+
+
+@app.put("/api/servers/{server_id}/schedules/{schedule_id}")
+def edit_schedule(
+    server_id: str,
+    schedule_id: int,
+    body: ScheduleBody,
+    user: dict[str, Any] = Depends(user_from_header),
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    require_server_permission(server, user, "schedule.update")
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(400, "Schedule name is required")
+    tasks = validate_schedule_tasks(body)
+    expr = body.cron.strip() or "*/5 * * * *"
+    if len(expr.split()) != 5:
+        raise HTTPException(400, "Cron expressions must contain five fields")
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT * FROM schedules WHERE id = ? AND server_id = ?", (schedule_id, server_id)
+        ).fetchone()
+        if not existing:
+            raise HTTPException(404, "Schedule not found")
+        conn.execute(
+            """UPDATE schedules SET name = ?, cron = ?, action = ?, payload = ?, enabled = ?,
+                      next_run = ? WHERE id = ? AND server_id = ?""",
+            (
+                name,
+                expr,
+                tasks[0]["action"],
+                tasks[0]["payload"],
+                1 if body.enabled else 0,
+                schedule_next_run(expr),
+                schedule_id,
+                server_id,
+            ),
+        )
+        replace_schedule_tasks(conn, schedule_id, tasks)
+        row = row_to_dict(conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone())
+        assert row is not None
+        schedule_payload(conn, row)
+    log_activity(user["id"], server_id, "schedule:update", {"name": name})
+    return {"data": row}
 
 
 @app.patch("/api/servers/{server_id}/schedules/{schedule_id}")
@@ -3398,7 +4492,8 @@ def update_schedule(
     body: ScheduleStateBody,
     user: dict[str, Any] = Depends(user_from_header),
 ) -> dict[str, Any]:
-    get_server(server_id, user)
+    server = get_server(server_id, user)
+    require_server_permission(server, user, "schedule.update")
     with db() as conn:
         row = conn.execute(
             "SELECT * FROM schedules WHERE id = ? AND server_id = ?", (schedule_id, server_id)
@@ -3410,39 +4505,45 @@ def update_schedule(
             "UPDATE schedules SET enabled = ?, next_run = ? WHERE id = ? AND server_id = ?",
             (1 if body.enabled else 0, next_run, schedule_id, server_id),
         )
-        out = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
-    return {"data": row_to_dict(out)}
+        out = row_to_dict(conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone())
+        assert out is not None
+        schedule_payload(conn, out)
+    return {"data": out}
 
 
 @app.post("/api/servers/{server_id}/schedules/{schedule_id}/run")
 async def run_schedule_now(
     server_id: str, schedule_id: int, user: dict[str, Any] = Depends(user_from_header)
-) -> dict[str, str]:
+) -> dict[str, Any]:
     server = get_server(server_id, user)
     reject_suspended(server)
+    require_server_permission(server, user, "schedule.update")
     with db() as conn:
         row = conn.execute(
             "SELECT * FROM schedules WHERE id = ? AND server_id = ?", (schedule_id, server_id)
         ).fetchone()
-    schedule = row_to_dict(row)
-    if not schedule:
-        raise HTTPException(404, "Schedule not found")
-    await execute_schedule_action(server, schedule)
+        schedule = row_to_dict(row)
+        if not schedule:
+            raise HTTPException(404, "Schedule not found")
+        schedule_payload(conn, schedule)
+    results = await execute_schedule(server, schedule)
     with db() as conn:
         conn.execute(
             "UPDATE schedules SET last_run = ?, next_run = ? WHERE id = ?",
             (utcnow(), schedule_next_run(str(schedule.get("cron") or "*/5 * * * *")), schedule_id),
         )
     log_activity(user["id"], server_id, "schedule:run", {"name": schedule["name"]})
-    return {"status": "ok"}
+    return {"status": "ok", "tasks": results}
 
 
 @app.delete("/api/servers/{server_id}/schedules/{schedule_id}")
 def delete_schedule(
     server_id: str, schedule_id: int, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, str]:
-    get_server(server_id, user)
+    server = get_server(server_id, user)
+    require_server_permission(server, user, "schedule.delete")
     with db() as conn:
+        conn.execute("DELETE FROM schedule_tasks WHERE schedule_id = ?", (schedule_id,))
         conn.execute("DELETE FROM schedules WHERE id = ? AND server_id = ?", (schedule_id, server_id))
     return {"status": "ok"}
 
@@ -3450,6 +4551,7 @@ def delete_schedule(
 @app.get("/api/servers/{server_id}/network")
 def network(server_id: str, user: dict[str, Any] = Depends(user_from_header)) -> dict[str, Any]:
     server = get_server(server_id, user)
+    require_server_permission(server, user, "allocation.read")
     with db() as conn:
         rows = rows_to_list(
             conn.execute(
@@ -3481,6 +4583,7 @@ def add_network_allocation(
 ) -> dict[str, Any]:
     server = get_server(server_id, user)
     reject_suspended(server)
+    require_server_permission(server, user, "allocation.create")
     with db() as conn:
         if body.allocation_id:
             row = conn.execute(
@@ -3510,6 +4613,7 @@ def set_primary_allocation(
 ) -> dict[str, str]:
     server = get_server(server_id, user)
     reject_suspended(server)
+    require_server_permission(server, user, "allocation.update")
     with db() as conn:
         row = conn.execute(
             "SELECT * FROM allocations WHERE id = ? AND server_id = ?", (allocation_id, server_id)
@@ -3536,6 +4640,7 @@ def delete_network_allocation(
 ) -> dict[str, str]:
     server = get_server(server_id, user)
     reject_suspended(server)
+    require_server_permission(server, user, "allocation.delete")
     with db() as conn:
         row = conn.execute(
             "SELECT * FROM allocations WHERE id = ? AND server_id = ?", (allocation_id, server_id)
@@ -3554,52 +4659,119 @@ def delete_network_allocation(
 
 @app.get("/api/servers/{server_id}/users")
 def list_subusers(server_id: str, user: dict[str, Any] = Depends(user_from_header)) -> dict[str, Any]:
-    get_server(server_id, user)
+    server = get_server(server_id, user)
+    require_server_permission(server, user, "user.read")
     with db() as conn:
         rows = conn.execute("SELECT * FROM subusers WHERE server_id = ?", (server_id,)).fetchall()
     data = []
     for r in rows_to_list(rows):
-        try:
-            r["permissions"] = json.loads(r.get("permissions") or "[]")
-        except json.JSONDecodeError:
-            r["permissions"] = []
+        r["permissions"] = parse_permissions(r.get("permissions"))
         data.append(r)
-    return {"data": data}
+    return {
+        "data": data,
+        "meta": {
+            "permission_groups": SERVER_PERMISSION_GROUPS,
+        },
+    }
 
 
 @app.post("/api/servers/{server_id}/users")
 def create_subuser(
     server_id: str, body: SubuserBody, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, Any]:
-    get_server(server_id, user)
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    require_server_permission(server, user, "user.create")
+    email = (body.email or "").strip().lower()
+    if "@" not in email:
+        raise HTTPException(400, "A valid account email is required")
+    permissions = parse_permissions(body.permissions)
     with db() as conn:
+        target = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        if not target:
+            raise HTTPException(404, "No panel account uses that email address")
+        if int(target["id"]) == int(server["owner_id"]):
+            raise HTTPException(400, "The server owner already has full access")
+        if conn.execute(
+            "SELECT id FROM subusers WHERE server_id = ? AND email = ?", (server_id, email)
+        ).fetchone():
+            raise HTTPException(409, "That account already has access to this server")
         cur = conn.execute(
             "INSERT INTO subusers (server_id, email, permissions, created_at) VALUES (?, ?, ?, ?)",
-            (server_id, body.email, json.dumps(body.permissions), utcnow()),
+            (server_id, email, json.dumps(permissions), utcnow()),
         )
-        row = conn.execute("SELECT * FROM subusers WHERE id = ?", (cur.lastrowid,)).fetchone()
-    return {"data": row_to_dict(row)}
+        row = row_to_dict(conn.execute("SELECT * FROM subusers WHERE id = ?", (cur.lastrowid,)).fetchone()) or {}
+    row["permissions"] = permissions
+    log_activity(
+        user["id"],
+        server_id,
+        "subuser:create",
+        {"email": email, "permissions": permissions},
+    )
+    return {"data": row}
+
+
+@app.put("/api/servers/{server_id}/users/{sub_id}")
+def update_subuser(
+    server_id: str,
+    sub_id: int,
+    body: SubuserBody,
+    user: dict[str, Any] = Depends(user_from_header),
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    reject_suspended(server)
+    require_server_permission(server, user, "user.update")
+    permissions = parse_permissions(body.permissions)
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM subusers WHERE id = ? AND server_id = ?", (sub_id, server_id)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Subuser not found")
+        conn.execute(
+            "UPDATE subusers SET permissions = ? WHERE id = ? AND server_id = ?",
+            (json.dumps(permissions), sub_id, server_id),
+        )
+        updated = row_to_dict(
+            conn.execute("SELECT * FROM subusers WHERE id = ?", (sub_id,)).fetchone()
+        ) or {}
+    updated["permissions"] = permissions
+    log_activity(
+        user["id"],
+        server_id,
+        "subuser:update",
+        {"email": row["email"], "permissions": permissions},
+    )
+    return {"data": updated}
 
 
 @app.delete("/api/servers/{server_id}/users/{sub_id}")
 def delete_subuser(
     server_id: str, sub_id: int, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, str]:
-    get_server(server_id, user)
+    server = get_server(server_id, user)
+    require_server_permission(server, user, "user.delete")
     with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM subusers WHERE id = ? AND server_id = ?", (sub_id, server_id)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Subuser not found")
         conn.execute("DELETE FROM subusers WHERE id = ? AND server_id = ?", (sub_id, server_id))
+    log_activity(user["id"], server_id, "subuser:delete", {"email": row["email"]})
     return {"status": "ok"}
 
 
 def ws_user(token: str | None) -> dict[str, Any]:
     payload = decode_token(token or "")
-    if not payload:
+    if not payload or payload.get("typ") == "2fa":
         raise HTTPException(401, "Invalid token")
     with db() as conn:
         row = conn.execute("SELECT * FROM users WHERE id = ?", (payload["uid"],)).fetchone()
     user = row_to_dict(row)
     if not user:
         raise HTTPException(401, "Invalid token")
+    user.pop("password_hash", None)
     return user
 
 
@@ -3693,6 +4865,7 @@ async def ws_terminal(websocket: WebSocket, server_id: str, token: str = Query("
                 *argv,
                 cwd=str(session["cwd"]),
                 env=shell_env,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 start_new_session=os.name != "nt",
@@ -3912,6 +5085,7 @@ async def ws_console(websocket: WebSocket, server_id: str, token: str = Query(""
         user = ws_user(token)
         server = get_server(server_id, user)
         reject_suspended(server)
+        require_server_permission(server, user, "websocket.connect")
     except HTTPException as exc:
         await websocket.send_json({"event": "error", "message": exc.detail})
         await websocket.close()
@@ -3932,14 +5106,32 @@ async def ws_console(websocket: WebSocket, server_id: str, token: str = Query(""
             try:
                 payload = json.loads(message)
             except json.JSONDecodeError:
+                try:
+                    require_server_permission(server, user, "control.console")
+                except HTTPException as exc:
+                    await websocket.send_json({"event": "error", "message": exc.detail})
+                    continue
                 await inst.send(message)
                 continue
             event = payload.get("event")
             if event == "send command":
+                try:
+                    require_server_permission(server, user, "control.console")
+                except HTTPException as exc:
+                    await websocket.send_json({"event": "error", "message": exc.detail})
+                    continue
                 args = payload.get("args") or [""]
                 await inst.send(str(args[0]))
             elif event == "set state":
                 sig = str((payload.get("args") or ["start"])[0])
+                if sig not in ("start", "stop", "restart", "kill"):
+                    await websocket.send_json({"event": "error", "message": "Unknown power signal"})
+                    continue
+                try:
+                    require_server_permission(server, user, f"control.{sig}")
+                except HTTPException as exc:
+                    await websocket.send_json({"event": "error", "message": exc.detail})
+                    continue
                 if sig == "start":
                     await inst.start()
                 elif sig == "stop":
@@ -3963,7 +5155,10 @@ async def ws_stats(websocket: WebSocket, server_id: str, token: str = Query(""))
     try:
         user = ws_user(token)
         server = get_server(server_id, user)
-    except HTTPException:
+        reject_suspended(server)
+        require_server_permission(server, user, "websocket.connect")
+    except HTTPException as exc:
+        await websocket.send_json({"event": "error", "message": exc.detail})
         await websocket.close()
         return
     inst = manager.get(server)
@@ -4018,6 +5213,477 @@ async def gate_proxy(
 
 
 # ── Admin ────────────────────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# Linux and panel host health
+# ---------------------------------------------------------------------------
+
+SYSTEM_SERVICE_CANDIDATES = [
+    "vitestl",
+    "kestrel",
+    "kestrel-panel",
+    "wings",
+    "docker",
+    "containerd",
+    "mariadb",
+    "mysql",
+    "postgresql",
+    "redis-server",
+    "nginx",
+    "caddy",
+    "ssh",
+    "ufw",
+    "fail2ban",
+    "unattended-upgrades",
+]
+
+
+def command_text(argv: list[str], timeout: float = 4.0) -> tuple[int, str]:
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 127, ""
+    output = (result.stdout or result.stderr or "").strip()
+    return result.returncode, output
+
+
+def read_os_release() -> dict[str, str]:
+    values: dict[str, str] = {}
+    for candidate in ("/etc/os-release", "/usr/lib/os-release"):
+        path = Path(candidate)
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if "=" not in line or line.lstrip().startswith("#"):
+                continue
+            key, _, raw = line.partition("=")
+            values[key.strip()] = raw.strip().strip('"').strip("'")
+        break
+    return values
+
+
+_PLATFORM_LABEL: str | None = None
+_SYSTEMCTL_AVAILABLE: bool | None = None
+_SWAP_SNAPSHOT: dict[str, Any] | None = None
+_SWAP_SNAPSHOT_AT = 0.0
+_SWAP_LOCK = threading.Lock()
+_PROCESS_BASELINE: dict[int, tuple[float, float, float]] = {}
+_PROCESS_SNAPSHOT_LOCK = threading.Lock()
+_SYSTEM_SNAPSHOT_CACHE: dict[str, Any] | None = None
+_SYSTEM_SNAPSHOT_CACHE_AT = 0.0
+_SYSTEM_SNAPSHOT_LOCK = threading.Lock()
+_SYSTEM_SNAPSHOT_TTL = 8.0
+_SWAP_SNAPSHOT_TTL = 30.0
+
+
+def platform_label() -> str:
+    global _PLATFORM_LABEL
+    if _PLATFORM_LABEL is None:
+        _PLATFORM_LABEL = platform.platform()
+    return _PLATFORM_LABEL
+
+
+def systemctl_available() -> bool:
+    global _SYSTEMCTL_AVAILABLE
+    if _SYSTEMCTL_AVAILABLE is None:
+        _SYSTEMCTL_AVAILABLE = bool(shutil.which("systemctl"))
+    return _SYSTEMCTL_AVAILABLE
+
+
+def swap_snapshot() -> dict[str, Any]:
+    """Cache the page-file query; it is unusually slow on Windows hosts."""
+    global _SWAP_SNAPSHOT, _SWAP_SNAPSHOT_AT
+    with _SWAP_LOCK:
+        now = time.monotonic()
+        cached = _SWAP_SNAPSHOT
+        if cached is None or now - _SWAP_SNAPSHOT_AT >= _SWAP_SNAPSHOT_TTL:
+            swap = psutil.swap_memory()
+            cached = {
+                "total": swap.total,
+                "used": swap.used,
+                "free": swap.free,
+                "percent": swap.percent,
+            }
+            _SWAP_SNAPSHOT = cached
+            _SWAP_SNAPSHOT_AT = now
+        return cached
+
+
+def process_snapshot() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Collect the top process tables without repeatedly walking every handle.
+
+    CPU percentages are derived from the previous snapshot, so the expensive
+    per-process ``cpu_percent`` probes are avoided. The first snapshot after a
+    restart reports zero CPU; subsequent snapshots are accurate.
+    """
+    now = time.monotonic()
+    cpu_count = psutil.cpu_count() or 1
+    rows: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    with _PROCESS_SNAPSHOT_LOCK:
+        for proc in psutil.process_iter(["pid", "name", "memory_info", "cpu_times", "create_time"]):
+            try:
+                info = proc.info or {}
+                pid = int(info.get("pid") or 0)
+                if pid <= 0:
+                    continue
+                memory = info.get("memory_info")
+                times = info.get("cpu_times")
+                created = float(info.get("create_time") or 0.0)
+                total = float(getattr(times, "user", 0.0) + getattr(times, "system", 0.0))
+                previous = _PROCESS_BASELINE.get(pid)
+                cpu = 0.0
+                if (
+                    previous
+                    and abs(previous[0] - created) < 0.01
+                    and now > previous[2]
+                    and previous[2] > 0
+                ):
+                    cpu = max(0.0, (total - previous[1]) / (now - previous[2]) * 100.0 / cpu_count)
+                _PROCESS_BASELINE[pid] = (created, total, now)
+                seen.add(pid)
+                rows.append(
+                    {
+                        "pid": pid,
+                        "name": info.get("name") or "",
+                        "username": "",
+                        "cpu_percent": round(min(cpu, 100.0 * cpu_count), 1),
+                        "memory_bytes": int(getattr(memory, "rss", 0) or 0),
+                        "command": "",
+                    }
+                )
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        for pid in [value for value in _PROCESS_BASELINE if value not in seen]:
+            _PROCESS_BASELINE.pop(pid, None)
+
+        by_memory = sorted(rows, key=lambda item: item["memory_bytes"], reverse=True)[:10]
+        by_cpu = sorted(
+            rows,
+            key=lambda item: (item["cpu_percent"], item["memory_bytes"]),
+            reverse=True,
+        )[:10]
+        top_pids = {row["pid"] for row in by_memory}
+        top_pids.update(row["pid"] for row in by_cpu)
+        for row in rows:
+            if row["pid"] not in top_pids:
+                continue
+            try:
+                proc = psutil.Process(row["pid"])
+                row["username"] = proc.username()
+                row["command"] = " ".join((proc.cmdline() or [])[:8])
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+    return by_memory, by_cpu
+
+
+def warm_system_caches() -> None:
+    try:
+        platform_label()
+        swap_snapshot()
+        process_snapshot()
+    except Exception:
+        pass
+
+
+def system_service_state(name: str) -> dict[str, Any]:
+    if not systemctl_available():
+        return {"name": name, "active": "unavailable", "enabled": "unavailable", "installed": False}
+    _, active = command_text(["systemctl", "is-active", name], timeout=3)
+    _, enabled = command_text(["systemctl", "is-enabled", name], timeout=3)
+    return {
+        "name": name,
+        "active": active.splitlines()[0].strip() if active else "unknown",
+        "enabled": enabled.splitlines()[0].strip() if enabled else "unknown",
+        "installed": "not-found" not in active,
+    }
+
+
+def ssh_security_posture() -> dict[str, Any]:
+    files = [Path("/etc/ssh/sshd_config")]
+    include_dir = Path("/etc/ssh/sshd_config.d")
+    if include_dir.is_dir():
+        files.extend(sorted(include_dir.glob("*.conf")))
+    values: dict[str, str] = {}
+    for path in files:
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            key, _, value = stripped.partition(" ")
+            key = key.strip().lower()
+            if key in ("passwordauthentication", "permitrootlogin", "pubkeyauthentication"):
+                values[key] = value.strip()
+    return {
+        "config_present": bool(values) or Path("/etc/ssh/sshd_config").exists(),
+        "password_authentication": values.get("passwordauthentication", "not set"),
+        "permit_root_login": values.get("permitrootlogin", "not set"),
+        "pubkey_authentication": values.get("pubkeyauthentication", "not set"),
+        "files": [str(p) for p in files if p.is_file()],
+    }
+
+
+def firewall_posture() -> dict[str, Any]:
+    if shutil.which("ufw"):
+        code, output = command_text(["ufw", "status"], timeout=4)
+        status = "active" if "Status: active" in output else "inactive"
+        return {
+            "manager": "ufw",
+            "status": status,
+            "detail": output.splitlines()[0] if output else "",
+            "code": code,
+        }
+    if shutil.which("firewall-cmd"):
+        code, output = command_text(["firewall-cmd", "--state"], timeout=3)
+        return {"manager": "firewalld", "status": output.strip() or "unknown", "detail": output, "code": code}
+    if shutil.which("nft"):
+        code, output = command_text(["nft", "list", "ruleset"], timeout=3)
+        return {
+            "manager": "nftables",
+            "status": "active" if code == 0 and output else "unknown",
+            "detail": "Ruleset available" if code == 0 and output else "No readable ruleset",
+            "code": code,
+        }
+    return {"manager": "none", "status": "not installed", "detail": "", "code": 127}
+
+
+def failed_system_units() -> list[dict[str, str]]:
+    if not systemctl_available():
+        return []
+    code, output = command_text(
+        ["systemctl", "list-units", "--state=failed", "--no-legend", "--plain", "--no-pager"],
+        timeout=5,
+    )
+    units: list[dict[str, str]] = []
+    if code != 0:
+        return units
+    for line in output.splitlines():
+        parts = line.split(None, 1)
+        if parts and parts[0].endswith(".service"):
+            units.append({"unit": parts[0], "description": parts[1].strip() if len(parts) > 1 else ""})
+    return units[:25]
+
+
+def system_security_checks(ssh: dict[str, Any], firewall: dict[str, Any]) -> list[dict[str, str]]:
+    checks: list[dict[str, str]] = []
+    password_auth = str(ssh.get("password_authentication") or "not set").lower()
+    if password_auth in ("no", "false"):
+        checks.append({"id": "ssh-password", "label": "SSH password authentication", "status": "ok", "detail": "Disabled"})
+    elif password_auth == "not set":
+        checks.append({"id": "ssh-password", "label": "SSH password authentication", "status": "warn", "detail": "Not explicitly disabled; OpenSSH defaults to enabled"})
+    else:
+        checks.append({"id": "ssh-password", "label": "SSH password authentication", "status": "warn", "detail": f"Enabled ({password_auth})"})
+    root_login = str(ssh.get("permit_root_login") or "not set").lower()
+    if root_login in ("no", "prohibit-password", "without-password"):
+        checks.append({"id": "ssh-root", "label": "SSH root login", "status": "ok", "detail": root_login})
+    else:
+        checks.append({"id": "ssh-root", "label": "SSH root login", "status": "warn", "detail": f"Policy: {root_login}"})
+    if firewall.get("status") == "active":
+        checks.append({"id": "firewall", "label": "Host firewall", "status": "ok", "detail": f"{firewall.get('manager')} active"})
+    elif firewall.get("status") in ("not installed", "unknown"):
+        checks.append({"id": "firewall", "label": "Host firewall", "status": "warn", "detail": str(firewall.get("status"))})
+    else:
+        checks.append({"id": "firewall", "label": "Host firewall", "status": "warn", "detail": f"{firewall.get('manager')} {firewall.get('status')}"})
+    apparmor_enabled = Path("/sys/module/apparmor/parameters/enabled")
+    apparmor = False
+    if apparmor_enabled.is_file():
+        try:
+            apparmor = apparmor_enabled.read_text(encoding="utf-8").strip().lower().startswith("y")
+        except OSError:
+            apparmor = False
+    checks.append(
+        {
+            "id": "apparmor",
+            "label": "AppArmor",
+            "status": "ok" if apparmor else "warn",
+            "detail": "Enabled" if apparmor else "Not enabled or not available",
+        }
+    )
+    unattended = Path("/etc/apt/apt.conf.d/20auto-upgrades")
+    unattended_ok = False
+    if unattended.is_file():
+        try:
+            text = unattended.read_text(encoding="utf-8", errors="replace")
+            unattended_ok = 'Unattended-Upgrade "1"' in text
+        except OSError:
+            unattended_ok = False
+    checks.append(
+        {
+            "id": "unattended-upgrades",
+            "label": "Automatic security updates",
+            "status": "ok" if unattended_ok else "warn",
+            "detail": "Configured" if unattended_ok else "Not configured",
+        }
+    )
+    reboot_required = Path("/var/run/reboot-required").exists()
+    checks.append(
+        {
+            "id": "reboot",
+            "label": "Reboot required",
+            "status": "warn" if reboot_required else "ok",
+            "detail": "A reboot is pending" if reboot_required else "No pending reboot",
+        }
+    )
+    return checks
+
+
+def _collect_system_health() -> dict[str, Any]:
+    load = list(os.getloadavg()) if hasattr(os, "getloadavg") else [0.0, 0.0, 0.0]
+    cpu_count = psutil.cpu_count() or 1
+    try:
+        cpu_percent = psutil.cpu_percent(interval=0.2)
+    except Exception:
+        cpu_percent = 0.0
+    frequency = psutil.cpu_freq()
+    vm = psutil.virtual_memory()
+    swap = swap_snapshot()
+    os_release = read_os_release()
+    failed = failed_system_units()
+    services = [system_service_state(name) for name in SYSTEM_SERVICE_CANDIDATES]
+    ssh = ssh_security_posture()
+    firewall = firewall_posture()
+    checks = system_security_checks(ssh, firewall)
+
+    disks: list[dict[str, Any]] = []
+    seen_mounts: set[str] = set()
+    for partition in psutil.disk_partitions(all=False):
+        mount = partition.mountpoint
+        if mount in seen_mounts or partition.fstype.lower() in ("squashfs", "iso9660", "tmpfs", "devtmpfs"):
+            continue
+        seen_mounts.add(mount)
+        try:
+            usage = psutil.disk_usage(mount)
+        except (OSError, PermissionError):
+            continue
+        disks.append(
+            {
+                "device": partition.device,
+                "mount": mount,
+                "fstype": partition.fstype,
+                "total": usage.total,
+                "used": usage.used,
+                "free": usage.free,
+                "percent": usage.percent,
+            }
+        )
+    disks.sort(key=lambda item: item["mount"])
+
+    by_memory, by_cpu = process_snapshot()
+
+    docker: dict[str, Any] = {"available": bool(shutil.which("docker"))}
+    if docker["available"]:
+        code, version = command_text(["docker", "version", "--format", "{{.Server.Version}}"], timeout=5)
+        docker["server_version"] = version.splitlines()[0] if code == 0 and version else ""
+        docker["running"] = code == 0
+        code, containers = command_text(["docker", "ps", "-q"], timeout=5)
+        docker["containers"] = len(containers.splitlines()) if code == 0 and containers else 0
+        code, info = command_text(
+            ["docker", "info", "--format", "{{.Driver}}|{{.DockerRootDir}}|{{.ServerVersion}}"],
+            timeout=5,
+        )
+        if code == 0 and info:
+            parts = info.split("|")
+            docker["driver"] = parts[0] if len(parts) > 0 else ""
+            docker["root_dir"] = parts[1] if len(parts) > 1 else ""
+
+    with db() as conn:
+        counts = {
+            "servers": conn.execute("SELECT COUNT(*) AS c FROM servers").fetchone()["c"],
+            "users": conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"],
+            "databases": conn.execute("SELECT COUNT(*) AS c FROM databases").fetchone()["c"],
+            "backups": conn.execute("SELECT COUNT(*) AS c FROM backups").fetchone()["c"],
+        }
+    db_path = DATA / "kestrel.db"
+    db_size = db_path.stat().st_size if db_path.exists() else 0
+    panel_storage = {
+        "data_dir": str(DATA),
+        "database_bytes": db_size,
+        "servers_bytes": dir_size(SERVERS_DIR),
+        "backups_bytes": dir_size(BACKUPS_DIR),
+        "counts": counts,
+    }
+    boot_time = int(psutil.boot_time())
+    return {
+        "host": {
+            "hostname": hostname(),
+            "platform": platform_label(),
+            "system": platform.system(),
+            "release": platform.release(),
+            "architecture": platform.machine(),
+            "python": platform.python_version(),
+            "pretty_name": os_release.get("PRETTY_NAME") or platform_label(),
+            "version": os_release.get("VERSION_ID") or "",
+            "debian_version": (
+                Path("/etc/debian_version").read_text(encoding="utf-8").strip()
+                if Path("/etc/debian_version").is_file()
+                else ""
+            ),
+            "boot_time": boot_time,
+            "uptime": max(0, int(time.time()) - boot_time),
+        },
+        "panel": {
+            "name": PANEL_NAME,
+            "version": PANEL_VERSION,
+            "wings": WINGS_VERSION,
+            "data": panel_storage,
+        },
+        "cpu": {
+            "cores": cpu_count,
+            "physical": psutil.cpu_count(logical=False) or cpu_count,
+            "percent": cpu_percent,
+            "load": [round(value, 2) for value in load],
+            "frequency_mhz": round(frequency.current, 1) if frequency else 0,
+            "per_core": psutil.cpu_percent(percpu=True, interval=0.1),
+        },
+        "memory": {"total": vm.total, "available": vm.available, "used": vm.used, "percent": vm.percent},
+        "swap": swap,
+        "disks": disks,
+        "services": services,
+        "failed_units": failed,
+        "processes": {"by_memory": by_memory, "by_cpu": by_cpu},
+        "security": {"checks": checks, "ssh": ssh, "firewall": firewall},
+        "docker": docker,
+        "generated_at": utcnow(),
+    }
+
+
+def system_health_snapshot() -> dict[str, Any]:
+    """Serve a short-lived snapshot so concurrent refreshes share one sample."""
+    global _SYSTEM_SNAPSHOT_CACHE, _SYSTEM_SNAPSHOT_CACHE_AT
+    now = time.monotonic()
+    cached = _SYSTEM_SNAPSHOT_CACHE
+    if cached is not None and now - _SYSTEM_SNAPSHOT_CACHE_AT < _SYSTEM_SNAPSHOT_TTL:
+        return cached
+    with _SYSTEM_SNAPSHOT_LOCK:
+        now = time.monotonic()
+        cached = _SYSTEM_SNAPSHOT_CACHE
+        if cached is None or now - _SYSTEM_SNAPSHOT_CACHE_AT >= _SYSTEM_SNAPSHOT_TTL:
+            cached = _collect_system_health()
+            _SYSTEM_SNAPSHOT_CACHE = cached
+            _SYSTEM_SNAPSHOT_CACHE_AT = time.monotonic()
+        return cached
+
+
+@app.get("/api/admin/system")
+def admin_system(_: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
+    return system_health_snapshot()
+
 
 @app.get("/api/admin/overview")
 def admin_overview(_: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
@@ -4082,6 +5748,838 @@ def admin_overview(_: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
             "recent_activity": decode_activity(rows_to_list(recent)),
         }
     }
+
+
+@app.get("/api/admin/database-hosts")
+def admin_database_hosts(_: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
+    with db() as conn:
+        rows = rows_to_list(
+            conn.execute(
+                """SELECT h.*, COUNT(d.id) AS databases
+                   FROM database_hosts h
+                   LEFT JOIN databases d ON d.host_id = h.id
+                   GROUP BY h.id ORDER BY h.name COLLATE NOCASE"""
+            ).fetchall()
+        )
+    for row in rows:
+        row.pop("password", None)
+        row["password_set"] = True
+    return {"data": rows, "meta": {"client": bool(mysql_client())}}
+
+
+def validate_database_host_body(body: DatabaseHostBody, require_password: bool) -> None:
+    if not (body.name or "").strip():
+        raise HTTPException(400, "A host name is required")
+    if not (body.host or "").strip():
+        raise HTTPException(400, "A database hostname or IP is required")
+    if not (body.username or "").strip():
+        raise HTTPException(400, "A database administrator username is required")
+    if require_password and not body.password:
+        raise HTTPException(400, "A database administrator password is required")
+    if body.engine not in ("mariadb", "mysql"):
+        raise HTTPException(400, "Engine must be mariadb or mysql")
+    if not (1 <= int(body.port) <= 65535):
+        raise HTTPException(400, "Port must be between 1 and 65535")
+    if int(body.max_databases) < 0:
+        raise HTTPException(400, "Database limit cannot be negative")
+
+
+@app.post("/api/admin/database-hosts")
+def admin_create_database_host(
+    body: DatabaseHostBody, user: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    validate_database_host_body(body, require_password=True)
+    with db() as conn:
+        cur = conn.execute(
+            """INSERT INTO database_hosts
+               (name, engine, host, port, username, password, linked_ip, max_databases, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                body.name.strip(),
+                body.engine,
+                body.host.strip(),
+                int(body.port),
+                body.username.strip(),
+                body.password,
+                body.linked_ip.strip(),
+                int(body.max_databases),
+                utcnow(),
+            ),
+        )
+        host_id = int(cur.lastrowid)
+    log_activity(user["id"], None, "database-host:create", {"id": host_id, "name": body.name.strip()})
+    return {"data": {"id": host_id, "name": body.name.strip()}}
+
+
+@app.post("/api/admin/database-hosts/test-connection")
+def admin_test_database_host_body(
+    body: DatabaseHostBody, _: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    validate_database_host_body(body, require_password=True)
+    started = time.monotonic()
+    version = mysql_execute(
+        {
+            "host": body.host.strip(),
+            "port": int(body.port),
+            "username": body.username.strip(),
+            "password": body.password,
+        },
+        "SELECT VERSION();",
+    )
+    return {
+        "status": "ok",
+        "version": version.splitlines()[0] if version else "",
+        "latency_ms": int((time.monotonic() - started) * 1000),
+    }
+
+
+@app.post("/api/admin/database-hosts/{host_id}/test")
+def admin_test_database_host(
+    host_id: int, _: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    host = database_host(host_id)
+    if not host:
+        raise HTTPException(404, "Database host not found")
+    started = time.monotonic()
+    version = mysql_execute(host, "SELECT VERSION();")
+    return {
+        "status": "ok",
+        "version": version.splitlines()[0] if version else "",
+        "latency_ms": int((time.monotonic() - started) * 1000),
+    }
+
+
+@app.put("/api/admin/database-hosts/{host_id}")
+def admin_update_database_host(
+    host_id: int, body: DatabaseHostBody, user: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    validate_database_host_body(body, require_password=False)
+    with db() as conn:
+        existing = conn.execute("SELECT * FROM database_hosts WHERE id = ?", (host_id,)).fetchone()
+        if not existing:
+            raise HTTPException(404, "Database host not found")
+        password = body.password or existing["password"]
+        conn.execute(
+            """UPDATE database_hosts SET name = ?, engine = ?, host = ?, port = ?, username = ?,
+                      password = ?, linked_ip = ?, max_databases = ? WHERE id = ?""",
+            (
+                body.name.strip(),
+                body.engine,
+                body.host.strip(),
+                int(body.port),
+                body.username.strip(),
+                password,
+                body.linked_ip.strip(),
+                int(body.max_databases),
+                host_id,
+            ),
+        )
+    log_activity(
+        user["id"], None, "database-host:update", {"id": host_id, "name": body.name.strip()}
+    )
+    return {"status": "ok"}
+
+
+@app.delete("/api/admin/database-hosts/{host_id}")
+def admin_delete_database_host(
+    host_id: int, user: dict[str, Any] = Depends(admin_user)
+) -> dict[str, str]:
+    with db() as conn:
+        host = conn.execute("SELECT * FROM database_hosts WHERE id = ?", (host_id,)).fetchone()
+        if not host:
+            raise HTTPException(404, "Database host not found")
+        count = conn.execute(
+            "SELECT COUNT(*) AS c FROM databases WHERE host_id = ?", (host_id,)
+        ).fetchone()["c"]
+        if int(count):
+            raise HTTPException(
+                409,
+                f"This host still manages {count} database(s). Remove them before deleting the host.",
+            )
+        conn.execute("DELETE FROM database_hosts WHERE id = ?", (host_id,))
+    log_activity(user["id"], None, "database-host:delete", {"id": host_id, "name": host["name"]})
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# AI providers and operations copilot
+# ---------------------------------------------------------------------------
+
+
+def ai_validate_provider_body(body: AiProviderBody) -> dict[str, Any]:
+    name = (body.name or "").strip()
+    kind = (body.kind or "").strip().lower()
+    base_url = (body.base_url or "").strip().rstrip("/")
+    model = (body.model or "").strip()
+    if not name:
+        raise HTTPException(400, "A provider name is required")
+    if len(name) > 80:
+        raise HTTPException(400, "Provider names are limited to 80 characters")
+    if kind not in AI_KINDS:
+        raise HTTPException(400, f"Unsupported provider kind: {kind}")
+    if not base_url:
+        raise HTTPException(400, "A base URL is required")
+    if not re.match(r"^https?://", base_url, re.IGNORECASE):
+        raise HTTPException(400, "The base URL must start with http:// or https://")
+    if len(base_url) > 500:
+        raise HTTPException(400, "The base URL is too long")
+    if not model:
+        raise HTTPException(400, "Choose a model for this provider")
+    if len(model) > 200:
+        raise HTTPException(400, "The model name is too long")
+    if not (64 <= int(body.max_tokens) <= 32000):
+        raise HTTPException(400, "Max tokens must be between 64 and 32000")
+    if not (0.0 <= float(body.temperature) <= 2.0):
+        raise HTTPException(400, "Temperature must be between 0 and 2")
+    try:
+        headers = ai_normalize_headers(body.headers)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if len(body.api_key) > 4096:
+        raise HTTPException(400, "The API key is too long")
+    return {
+        "name": name,
+        "kind": kind,
+        "base_url": base_url,
+        "model": model,
+        "headers": headers,
+        "max_tokens": int(body.max_tokens),
+        "temperature": round(float(body.temperature), 2),
+        "enabled": 1 if body.enabled else 0,
+    }
+
+
+def ai_provider_row(provider_id: int) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM ai_providers WHERE id = ?", (provider_id,)).fetchone()
+    data = row_to_dict(row)
+    if not data:
+        raise HTTPException(404, "AI provider not found")
+    return data
+
+
+def ai_default_provider(conn: Any) -> int:
+    row = conn.execute(
+        "SELECT id FROM ai_providers WHERE enabled = 1 ORDER BY is_default DESC, id ASC LIMIT 1"
+    ).fetchone()
+    return int(row["id"]) if row else 0
+
+
+def ai_provider_config(body: AiProviderBody) -> dict[str, Any]:
+    config = ai_validate_provider_body(body)
+    if body.id:
+        existing = ai_provider_row(int(body.id))
+        config["api_key"] = body.api_key or existing.get("api_key") or ""
+        if not config["headers"]:
+            try:
+                config["headers"] = ai_normalize_headers(existing.get("headers"))
+            except ValueError:
+                config["headers"] = {}
+    else:
+        config["api_key"] = body.api_key
+    config["id"] = body.id
+    return config
+
+
+@app.get("/api/admin/ai/providers")
+def admin_ai_providers(_: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
+    with db() as conn:
+        rows = rows_to_list(
+            conn.execute(
+                """SELECT p.*,
+                          (SELECT COUNT(*) FROM ai_usage u WHERE u.provider_id = p.id) AS requests,
+                          (SELECT MAX(u.created_at) FROM ai_usage u WHERE u.provider_id = p.id) AS last_used
+                   FROM ai_providers p
+                   ORDER BY p.is_default DESC, p.name COLLATE NOCASE"""
+            ).fetchall()
+        )
+    data = []
+    for row in rows:
+        cleaned = ai_public_provider(row)
+        if cleaned:
+            data.append(cleaned)
+    return {
+        "data": data,
+        "meta": {
+            "presets": AI_PRESETS,
+            "kinds": list(AI_KINDS),
+            "default_provider_id": next(
+                (item["id"] for item in data if item.get("is_default") and item.get("enabled")),
+                0,
+            ),
+        },
+    }
+
+
+@app.post("/api/admin/ai/providers")
+def admin_create_ai_provider(
+    body: AiProviderBody, user: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    config = ai_validate_provider_body(body)
+    now = utcnow()
+    wants_default = bool(body.is_default) and bool(config["enabled"])
+    with db() as conn:
+        if wants_default:
+            conn.execute("UPDATE ai_providers SET is_default = 0")
+        cur = conn.execute(
+            """INSERT INTO ai_providers
+               (name, kind, base_url, api_key, model, headers, max_tokens,
+                temperature, enabled, is_default, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                config["name"],
+                config["kind"],
+                config["base_url"],
+                body.api_key,
+                config["model"],
+                json.dumps(config["headers"]),
+                config["max_tokens"],
+                config["temperature"],
+                config["enabled"],
+                1 if wants_default else 0,
+                now,
+                now,
+            ),
+        )
+        provider_id = int(cur.lastrowid)
+        has_default = conn.execute(
+            "SELECT COUNT(*) AS c FROM ai_providers WHERE is_default = 1 AND enabled = 1"
+        ).fetchone()["c"]
+        if not int(has_default) and config["enabled"]:
+            conn.execute("UPDATE ai_providers SET is_default = 1 WHERE id = ?", (provider_id,))
+    log_activity(
+        user["id"],
+        None,
+        "ai-provider:create",
+        {"id": provider_id, "name": config["name"], "kind": config["kind"]},
+    )
+    return {"data": ai_public_provider(ai_provider_row(provider_id))}
+
+
+@app.put("/api/admin/ai/providers/{provider_id}")
+def admin_update_ai_provider(
+    provider_id: int, body: AiProviderBody, user: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    config = ai_validate_provider_body(body)
+    existing = ai_provider_row(provider_id)
+    key = body.api_key or existing.get("api_key") or ""
+    wants_default = bool(body.is_default) and bool(config["enabled"])
+    with db() as conn:
+        if wants_default:
+            conn.execute("UPDATE ai_providers SET is_default = 0")
+        conn.execute(
+            """UPDATE ai_providers SET name = ?, kind = ?, base_url = ?, api_key = ?,
+                      model = ?, headers = ?, max_tokens = ?, temperature = ?,
+                      enabled = ?, is_default = ?, updated_at = ?
+               WHERE id = ?""",
+            (
+                config["name"],
+                config["kind"],
+                config["base_url"],
+                key,
+                config["model"],
+                json.dumps(config["headers"]),
+                config["max_tokens"],
+                config["temperature"],
+                config["enabled"],
+                1 if wants_default else 0,
+                utcnow(),
+                provider_id,
+            ),
+        )
+        current_default = conn.execute(
+            "SELECT COUNT(*) AS c FROM ai_providers WHERE is_default = 1 AND enabled = 1"
+        ).fetchone()["c"]
+        if not int(current_default):
+            fallback = conn.execute(
+                "SELECT id FROM ai_providers WHERE enabled = 1 ORDER BY id ASC LIMIT 1"
+            ).fetchone()
+            if fallback:
+                conn.execute(
+                    "UPDATE ai_providers SET is_default = 1 WHERE id = ?",
+                    (int(fallback["id"]),),
+                )
+    log_activity(
+        user["id"],
+        None,
+        "ai-provider:update",
+        {"id": provider_id, "name": config["name"], "kind": config["kind"]},
+    )
+    return {"data": ai_public_provider(ai_provider_row(provider_id))}
+
+
+@app.delete("/api/admin/ai/providers/{provider_id}")
+def admin_delete_ai_provider(
+    provider_id: int, user: dict[str, Any] = Depends(admin_user)
+) -> dict[str, str]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM ai_providers WHERE id = ?", (provider_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "AI provider not found")
+        conn.execute("DELETE FROM ai_providers WHERE id = ?", (provider_id,))
+        conn.execute("UPDATE ai_messages SET provider_id = NULL WHERE provider_id = ?", (provider_id,))
+        conn.execute("UPDATE ai_usage SET provider_id = NULL WHERE provider_id = ?", (provider_id,))
+        if int(row["is_default"]):
+            fallback = ai_default_provider(conn)
+            if fallback:
+                conn.execute("UPDATE ai_providers SET is_default = 1 WHERE id = ?", (fallback,))
+    log_activity(
+        user["id"], None, "ai-provider:delete", {"id": provider_id, "name": row["name"]}
+    )
+    return {"status": "ok"}
+
+
+@app.post("/api/admin/ai/providers/{provider_id}/default")
+def admin_default_ai_provider(
+    provider_id: int, user: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    ai_provider_row(provider_id)
+    with db() as conn:
+        conn.execute("UPDATE ai_providers SET is_default = 0")
+        conn.execute(
+            "UPDATE ai_providers SET is_default = 1, enabled = 1 WHERE id = ?",
+            (provider_id,),
+        )
+    log_activity(user["id"], None, "ai-provider:default", {"id": provider_id})
+    return {"data": ai_public_provider(ai_provider_row(provider_id))}
+
+
+@app.post("/api/admin/ai/providers/{provider_id}/test")
+async def admin_test_ai_provider(
+    provider_id: int, user: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    provider = ai_provider_row(provider_id)
+    try:
+        result = await ai_test_provider(provider)
+    except ProviderError as exc:
+        log_activity(
+            user["id"], None, "ai-provider:test", {"id": provider_id, "ok": False, "error": exc.message}
+        )
+        raise HTTPException(400, exc.message) from exc
+    log_activity(
+        user["id"],
+        None,
+        "ai-provider:test",
+        {"id": provider_id, "ok": True, "latency_ms": result["latency_ms"]},
+    )
+    return result
+
+
+@app.post("/api/admin/ai/providers/test")
+async def admin_test_ai_provider_draft(
+    body: AiProviderBody, _: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    config = ai_provider_config(body)
+    try:
+        return await ai_test_provider(config)
+    except ProviderError as exc:
+        raise HTTPException(400, exc.message) from exc
+
+
+@app.get("/api/admin/ai/providers/{provider_id}/models")
+async def admin_ai_provider_models(
+    provider_id: int, _: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    provider = ai_provider_row(provider_id)
+    try:
+        models = await ai_list_models(provider)
+    except ProviderError as exc:
+        raise HTTPException(400, exc.message) from exc
+    return {"data": models, "meta": {"kind": provider["kind"]}}
+
+
+@app.post("/api/admin/ai/providers/models")
+async def admin_ai_provider_models_draft(
+    body: AiProviderBody, _: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    config = ai_provider_config(body)
+    try:
+        models = await ai_list_models(config)
+    except ProviderError as exc:
+        raise HTTPException(400, exc.message) from exc
+    return {"data": models, "meta": {"kind": config["kind"]}}
+
+
+@app.get("/api/admin/ai/usage")
+def admin_ai_usage(
+    days: int = 30, _: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    days = max(1, min(365, int(days)))
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with db() as conn:
+        totals = row_to_dict(
+            conn.execute(
+                """SELECT COUNT(*) AS requests,
+                          COALESCE(SUM(total_tokens), 0) AS tokens,
+                          COALESCE(SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END), 0) AS succeeded,
+                          COALESCE(SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END), 0) AS failed,
+                          COALESCE(AVG(latency_ms), 0) AS avg_latency_ms
+                   FROM ai_usage WHERE created_at >= ?""",
+                (since,),
+            ).fetchone()
+        ) or {}
+        totals["avg_latency_ms"] = round(float(totals.get("avg_latency_ms") or 0))
+        providers = rows_to_list(
+            conn.execute(
+                """SELECT p.id, p.name, p.kind, p.model, p.is_default,
+                          COUNT(u.id) AS requests,
+                          COALESCE(SUM(u.total_tokens), 0) AS tokens,
+                          COALESCE(SUM(CASE WHEN u.ok = 0 THEN 1 ELSE 0 END), 0) AS failures,
+                          MAX(u.created_at) AS last_used
+                   FROM ai_providers p
+                   LEFT JOIN ai_usage u ON u.provider_id = p.id AND u.created_at >= ?
+                   GROUP BY p.id
+                   ORDER BY requests DESC, p.name COLLATE NOCASE""",
+                (since,),
+            ).fetchall()
+        )
+        recent = rows_to_list(
+            conn.execute(
+                """SELECT u.id, u.provider_id, p.name AS provider_name, u.server_id,
+                          u.model, u.total_tokens, u.latency_ms, u.ok, u.error, u.created_at
+                   FROM ai_usage u
+                   LEFT JOIN ai_providers p ON p.id = u.provider_id
+                   ORDER BY u.id DESC LIMIT 20"""
+            ).fetchall()
+        )
+    for row in providers:
+        row["is_default"] = bool(row.get("is_default"))
+    for row in recent:
+        row["ok"] = bool(row.get("ok"))
+    return {
+        "totals": totals,
+        "providers": providers,
+        "recent": recent,
+        "window_days": days,
+    }
+
+
+def ai_provider_options(conn: Any) -> tuple[list[dict[str, Any]], int]:
+    rows = rows_to_list(
+        conn.execute(
+            """SELECT id, name, kind, model, is_default, enabled
+               FROM ai_providers WHERE enabled = 1
+               ORDER BY is_default DESC, name COLLATE NOCASE"""
+        ).fetchall()
+    )
+    for row in rows:
+        row["is_default"] = bool(row.get("is_default"))
+    default_id = next((int(row["id"]) for row in rows if row["is_default"]), 0)
+    if not default_id and rows:
+        default_id = int(rows[0]["id"])
+    return rows, default_id
+
+
+def ai_chat_provider(provider_id: int | None) -> dict[str, Any]:
+    with db() as conn:
+        if provider_id:
+            row = conn.execute(
+                "SELECT * FROM ai_providers WHERE id = ? AND enabled = 1", (provider_id,)
+            ).fetchone()
+            if not row:
+                raise HTTPException(404, "That AI provider is unavailable or disabled")
+        else:
+            row = conn.execute(
+                """SELECT * FROM ai_providers WHERE enabled = 1
+                   ORDER BY is_default DESC, id ASC LIMIT 1"""
+            ).fetchone()
+    data = row_to_dict(row)
+    if not data:
+        raise HTTPException(
+            409,
+            "No AI provider is configured. Add one in Administration, then open AI providers.",
+        )
+    return data
+
+
+def ai_system_prompt(server: dict[str, Any], body: AiChatBody) -> str:
+    environment = server.get("environment")
+    if isinstance(environment, str):
+        try:
+            environment = json.loads(environment)
+        except json.JSONDecodeError:
+            environment = {}
+    environment = environment or {}
+    allocation = f"{server.get('allocation_ip') or '0.0.0.0'}:{server.get('allocation_port') or '-'}"
+    details = [
+        "You are the VITESTERTL Operations Copilot, embedded in a game-server control panel.",
+        "You help a server owner or administrator operate one specific server. You are not a generic chatbot.",
+        "",
+        "Server facts:",
+        f"- Name: {server.get('name') or 'server'}",
+        f"- Identifier: {server.get('short_id') or server.get('id')}",
+        f"- Egg: {server.get('egg_name') or 'unknown'} ({server.get('nest_name') or 'unknown'})",
+        f"- Power state: {server.get('status') or 'unknown'}",
+        f"- Owner: {server.get('owner_name') or 'unknown'}",
+        f"- Primary allocation: {allocation}",
+        f"- Limits: {server.get('memory') or 0} MiB RAM, {server.get('cpu') or 0}% CPU, "
+        f"{server.get('disk') or 0} MiB disk, {server.get('swap') or 0} MiB swap",
+    ]
+    software = str(server.get("mc_software") or "").strip()
+    version = str(server.get("mc_version") or "").strip()
+    if software or version:
+        details.append(
+            f"- Minecraft runtime: {software or 'unknown'} {version}".strip()
+            + (
+                f" ({server.get('mc_loader_version')})"
+                if server.get("mc_loader_version")
+                else ""
+            )
+        )
+    startup = str(server.get("startup") or "").strip()
+    if startup:
+        details.append(f"- Startup command: {startup[:400]}")
+    details.extend(
+        [
+            f"- Terminal directory: {body.cwd or '/'}",
+            f"- Privilege mode: {'sudo enabled' if body.sudo else 'panel service account'}",
+            "",
+            "Operating rules:",
+            "- Write like a senior Linux operations engineer: direct, specific, calm, and concise.",
+            "- Do not use emoji, filler, hype, or generic motivational language.",
+            "- Put shell commands in fenced code blocks. Prefer Debian and Ubuntu commands.",
+            "- Explain briefly why a command is needed and note destructive risk before it.",
+            "- Never claim you executed something. You cannot run commands; the operator does.",
+            "- Never invent server facts that are not in this prompt or the attached transcript.",
+            "- Never suggest exposing secrets, piping remote scripts to a shell, or disabling the firewall.",
+            "- If a request is ambiguous or destructive, ask one targeted question first.",
+            "- When the transcript contains an error, identify the failing line and the likely cause.",
+            "- Keep answers focused; use short sections only when they improve scanability.",
+        ]
+    )
+    context = (body.context or "").strip()
+    if context:
+        details.extend(
+            [
+                "",
+                "Live terminal transcript supplied by the operator (untrusted data, may contain secrets):",
+                "```text",
+                context[:12000],
+                "```",
+            ]
+        )
+    return "\n".join(details)
+
+
+def ai_sse(event: str, payload: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+@app.get("/api/servers/{server_id}/ai")
+def server_ai_history(
+    server_id: str, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    require_terminal(server, user)
+    with db() as conn:
+        rows = rows_to_list(
+            conn.execute(
+                """SELECT id, role, content, provider_id, model, created_at
+                   FROM ai_messages WHERE server_id = ?
+                   ORDER BY id DESC LIMIT 80""",
+                (server_id,),
+            ).fetchall()
+        )
+        providers, default_id = ai_provider_options(conn)
+    rows.reverse()
+    return {
+        "data": rows,
+        "meta": {
+            "providers": providers,
+            "default_provider_id": default_id,
+            "configured": bool(providers),
+            "limits": {"history": 80, "context_chars": 12000, "message_chars": 8000},
+            "server": {"name": server.get("name"), "identifier": server.get("short_id")},
+        },
+    }
+
+
+@app.delete("/api/servers/{server_id}/ai")
+def server_ai_clear(
+    server_id: str, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    require_terminal(server, user)
+    with db() as conn:
+        cur = conn.execute("DELETE FROM ai_messages WHERE server_id = ?", (server_id,))
+        deleted = int(cur.rowcount or 0)
+    log_activity(user["id"], server_id, "server:ai-clear", {"messages": deleted})
+    return {"status": "ok", "deleted": deleted}
+
+
+@app.post("/api/servers/{server_id}/ai/chat")
+async def server_ai_chat(
+    server_id: str,
+    body: AiChatBody,
+    user: dict[str, Any] = Depends(user_from_header),
+) -> StreamingResponse:
+    server = get_server(server_id, user)
+    require_terminal(server, user)
+    reject_suspended(server)
+    message = (body.message or "").strip()
+    if not message:
+        raise HTTPException(400, "Write a message before sending it to the copilot")
+    if len(message) > 8000:
+        raise HTTPException(400, "Messages are limited to 8000 characters")
+    provider = ai_chat_provider(body.provider_id)
+    context = (body.context or "").strip()[:12000] if body.context else ""
+    body.context = context
+    system = ai_system_prompt(server, body)
+    with db() as conn:
+        history = rows_to_list(
+            conn.execute(
+                """SELECT role, content FROM ai_messages
+                   WHERE server_id = ? ORDER BY id DESC LIMIT 24""",
+                (server_id,),
+            ).fetchall()
+        )
+        cur = conn.execute(
+            """INSERT INTO ai_messages (server_id, user_id, role, content, provider_id, model, created_at)
+               VALUES (?, ?, 'user', ?, ?, ?, ?)""",
+            (
+                server_id,
+                user["id"],
+                message,
+                provider["id"],
+                provider.get("model") or "",
+                utcnow(),
+            ),
+        )
+        user_message_id = int(cur.lastrowid)
+    conversation = [
+        {"role": row["role"], "content": row["content"]}
+        for row in reversed(history)
+        if row.get("role") in ("user", "assistant")
+    ]
+    conversation.append({"role": "user", "content": message})
+    provider_id = int(provider["id"])
+    provider_name = str(provider.get("name") or "")
+    provider_model = str(provider.get("model") or "")
+    prompt_for_usage = system + "\n" + "\n".join(
+        item["content"] for item in conversation
+    )
+
+    async def event_stream() -> Any:
+        started = time.monotonic()
+        parts: list[str] = []
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        recorded = False
+
+        def record(reply: str, ok: bool, error: str = "") -> int | None:
+            nonlocal recorded
+            if recorded:
+                return None
+            recorded = True
+            latency = int((time.monotonic() - started) * 1000)
+            if not usage["total_tokens"]:
+                estimate = ai_estimate_usage(prompt_for_usage, reply)
+                usage.update(estimate)
+            assistant_id = None
+            with db() as conn:
+                if reply.strip():
+                    cur = conn.execute(
+                        """INSERT INTO ai_messages
+                           (server_id, user_id, role, content, provider_id, model, created_at)
+                           VALUES (?, ?, 'assistant', ?, ?, ?, ?)""",
+                        (
+                            server_id,
+                            user["id"],
+                            reply.strip()[:40000],
+                            provider_id,
+                            provider_model,
+                            utcnow(),
+                        ),
+                    )
+                    assistant_id = int(cur.lastrowid)
+                conn.execute(
+                    """INSERT INTO ai_usage
+                       (provider_id, server_id, user_id, model, prompt_tokens,
+                        completion_tokens, total_tokens, latency_ms, ok, error, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        provider_id,
+                        server_id,
+                        user["id"],
+                        provider_model,
+                        int(usage["prompt_tokens"]),
+                        int(usage["completion_tokens"]),
+                        int(usage["total_tokens"]),
+                        latency,
+                        1 if ok else 0,
+                        error[:500],
+                        utcnow(),
+                    ),
+                )
+            log_activity(
+                user["id"],
+                server_id,
+                "server:ai-chat",
+                {
+                    "provider": provider_name,
+                    "model": provider_model,
+                    "tokens": int(usage["total_tokens"]),
+                    "ok": ok,
+                },
+            )
+            return assistant_id
+
+        try:
+            yield ai_sse(
+                "meta",
+                {
+                    "user_message_id": user_message_id,
+                    "provider": {
+                        "id": provider_id,
+                        "name": provider_name,
+                        "kind": provider.get("kind"),
+                        "model": provider_model,
+                    },
+                },
+            )
+            async for item in ai_stream_chat(provider, conversation, system):
+                if item.get("type") == "delta":
+                    text = str(item.get("text") or "")
+                    if text:
+                        parts.append(text)
+                        yield ai_sse("delta", {"text": text})
+                elif item.get("type") == "usage":
+                    usage = {
+                        "prompt_tokens": int(item.get("prompt_tokens") or 0),
+                        "completion_tokens": int(item.get("completion_tokens") or 0),
+                        "total_tokens": int(item.get("total_tokens") or 0),
+                    }
+            reply = "".join(parts).strip()
+            if not reply:
+                raise ProviderError("The provider returned an empty response")
+            assistant_id = record(reply, True)
+            yield ai_sse(
+                "done",
+                {
+                    "message_id": assistant_id,
+                    "usage": usage,
+                    "latency_ms": int((time.monotonic() - started) * 1000),
+                },
+            )
+        except ProviderError as exc:
+            record("".join(parts).strip(), False, exc.message)
+            yield ai_sse("error", {"message": exc.message})
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            message_text = str(exc).strip()[:300] or "The copilot request failed"
+            record("".join(parts).strip(), False, message_text)
+            yield ai_sse("error", {"message": message_text})
+        finally:
+            if not recorded:
+                record("".join(parts).strip(), False, "The stream closed before completion")
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.get("/api/admin/activity")
@@ -5022,6 +7520,7 @@ def meta() -> dict[str, Any]:
     }
 
 
+@app.get("/health")
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}

@@ -4,9 +4,12 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import secrets
+import struct
 import time
 from typing import Any
+from urllib.parse import quote, urlencode
 
 from config import SECRET, TOKEN_TTL
 
@@ -62,3 +65,75 @@ def decode_token(token: str) -> dict[str, Any] | None:
     if int(payload.get("exp", 0)) < int(time.time()):
         return None
     return payload
+
+
+# ---------------------------------------------------------------------------
+# Time-based one-time passwords (RFC 6238) and recovery codes
+# ---------------------------------------------------------------------------
+
+TOTP_STEP = 30
+TOTP_DIGITS = 6
+
+
+def generate_totp_secret() -> str:
+    return base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
+
+
+def _hotp(secret: str, counter: int) -> str:
+    padded = secret + "=" * (-len(secret) % 8)
+    key = base64.b32decode(padded)
+    digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    value = struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF
+    return str(value % (10**TOTP_DIGITS)).zfill(TOTP_DIGITS)
+
+
+def totp_code(secret: str, at: float | None = None) -> tuple[str, int]:
+    counter = int((at if at is not None else time.time()) // TOTP_STEP)
+    return _hotp(secret, counter), counter
+
+
+def verify_totp(
+    secret: str, code: str, window: int = 1, last_step: int = 0
+) -> tuple[bool, int]:
+    """Verify a six-digit code and reject replayed steps.
+
+    ``last_step`` is the counter stored after the previous successful login.
+    Codes belonging to that step or an earlier step are never accepted again.
+    """
+
+    cleaned = re.sub(r"\s+", "", code or "")
+    if not cleaned.isdigit() or len(cleaned) != TOTP_DIGITS:
+        return False, 0
+    counter = int(time.time() // TOTP_STEP)
+    for delta in range(-window, window + 1):
+        candidate = counter + delta
+        if candidate <= last_step:
+            continue
+        if hmac.compare_digest(_hotp(secret, candidate), cleaned):
+            return True, candidate
+    return False, 0
+
+
+def otpauth_uri(secret: str, account: str, issuer: str) -> str:
+    label = quote(f"{issuer}:{account}", safe="")
+    query = urlencode(
+        {
+            "secret": secret,
+            "issuer": issuer,
+            "algorithm": "SHA1",
+            "digits": TOTP_DIGITS,
+            "period": TOTP_STEP,
+        }
+    )
+    return f"otpauth://totp/{label}?{query}"
+
+
+def generate_recovery_code() -> str:
+    raw = secrets.token_hex(4).upper()
+    return f"{raw[:4]}-{raw[4:]}"
+
+
+def hash_recovery_code(code: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9]", "", code or "").upper()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()

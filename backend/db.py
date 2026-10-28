@@ -68,7 +68,10 @@ def init_db() -> None:
                 email TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 role TEXT NOT NULL DEFAULT 'user',
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                totp_secret TEXT NOT NULL DEFAULT '',
+                totp_enabled INTEGER NOT NULL DEFAULT 0,
+                totp_last_step INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS nests (
@@ -121,6 +124,21 @@ def init_db() -> None:
                 password TEXT NOT NULL,
                 host TEXT NOT NULL DEFAULT '127.0.0.1',
                 port INTEGER NOT NULL DEFAULT 3306,
+                host_id INTEGER,
+                engine TEXT NOT NULL DEFAULT 'sqlite',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS database_hosts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                engine TEXT NOT NULL DEFAULT 'mariadb',
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL DEFAULT 3306,
+                username TEXT NOT NULL,
+                password TEXT NOT NULL,
+                linked_ip TEXT NOT NULL DEFAULT '',
+                max_databases INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             );
 
@@ -146,6 +164,24 @@ def init_db() -> None:
                 enabled INTEGER NOT NULL DEFAULT 1,
                 last_run TEXT,
                 next_run TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS schedule_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                schedule_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                payload TEXT NOT NULL DEFAULT '',
+                time_offset INTEGER NOT NULL DEFAULT 0,
+                sequence INTEGER NOT NULL DEFAULT 0,
+                continue_on_failure INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS user_recovery_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                code_hash TEXT NOT NULL,
+                used_at TEXT,
                 created_at TEXT NOT NULL
             );
 
@@ -294,6 +330,51 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     _add_column(conn, "servers", "terminal_sudo", "terminal_sudo INTEGER NOT NULL DEFAULT 0")
     _add_column(conn, "schedules", "next_run", "next_run TEXT")
     _add_column(conn, "allocations", "node_id", "node_id INTEGER NOT NULL DEFAULT 1")
+    _add_column(conn, "users", "totp_secret", "totp_secret TEXT NOT NULL DEFAULT ''")
+    _add_column(conn, "users", "totp_enabled", "totp_enabled INTEGER NOT NULL DEFAULT 0")
+    _add_column(conn, "users", "totp_last_step", "totp_last_step INTEGER NOT NULL DEFAULT 0")
+    _add_column(conn, "databases", "host_id", "host_id INTEGER")
+    _add_column(conn, "databases", "engine", "engine TEXT NOT NULL DEFAULT 'sqlite'")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS database_hosts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            engine TEXT NOT NULL DEFAULT 'mariadb',
+            host TEXT NOT NULL,
+            port INTEGER NOT NULL DEFAULT 3306,
+            username TEXT NOT NULL,
+            password TEXT NOT NULL,
+            linked_ip TEXT NOT NULL DEFAULT '',
+            max_databases INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schedule_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            schedule_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            payload TEXT NOT NULL DEFAULT '',
+            time_offset INTEGER NOT NULL DEFAULT 0,
+            sequence INTEGER NOT NULL DEFAULT 0,
+            continue_on_failure INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_recovery_codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            code_hash TEXT NOT NULL,
+            used_at TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS api_keys (
@@ -327,6 +408,57 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ai_providers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'openai',
+            base_url TEXT NOT NULL DEFAULT '',
+            api_key TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            headers TEXT NOT NULL DEFAULT '{}',
+            max_tokens INTEGER NOT NULL DEFAULT 2048,
+            temperature REAL NOT NULL DEFAULT 0.4,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ai_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            provider_id INTEGER,
+            model TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ai_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_id INTEGER,
+            server_id TEXT NOT NULL DEFAULT '',
+            user_id INTEGER NOT NULL DEFAULT 0,
+            model TEXT NOT NULL DEFAULT '',
+            prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            latency_ms INTEGER NOT NULL DEFAULT 0,
+            ok INTEGER NOT NULL DEFAULT 1,
+            error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_servers_owner ON servers(owner_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_servers_node ON servers(node_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_created ON activity(created_at)")
@@ -336,6 +468,20 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_plugin_installs_server ON plugin_installs(server_id)"
     )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_schedule_tasks_schedule ON schedule_tasks(schedule_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_recovery_codes_user ON user_recovery_codes(user_id)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_databases_host ON databases(host_id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ai_messages_server ON ai_messages(server_id, id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ai_usage_provider ON ai_usage(provider_id, created_at)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_usage_server ON ai_usage(server_id)")
 
 
 def sync_catalog(conn: sqlite3.Connection) -> dict[str, int]:
