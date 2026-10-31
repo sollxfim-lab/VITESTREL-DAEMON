@@ -264,7 +264,7 @@ def init_db() -> None:
                 "INSERT INTO users (username, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)",
                 (
                     "operator",
-                    "operator@vitestl.local",
+                    "operator@meridian.local",
                     hash_password("operator"),
                     "user",
                     utcnow(),
@@ -283,11 +283,11 @@ def init_db() -> None:
             for k, v in defaults.items():
                 conn.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (k, v))
 
-        # Carry existing installations across the VITESTERTL rename without
+        # Carry existing installations across the Meridian rename without
         # touching a company name that an operator has customised.
         conn.execute(
             "UPDATE settings SET value = ? WHERE key = 'company' "
-            "AND value IN ('Kestrel Control Plane', 'BUILDP CONTINUE')",
+            "AND value IN ('VITESTERTL', 'Kestrel Control Plane', 'BUILDP CONTINUE')",
             (PANEL_COMPANY,),
         )
         conn.execute(
@@ -298,9 +298,19 @@ def init_db() -> None:
             "UPDATE OR IGNORE users SET email = REPLACE(email, '@buildp.local', '@vitestl.local') "
             "WHERE email LIKE '%@buildp.local'"
         )
+        conn.execute(
+            "UPDATE OR IGNORE users SET email = REPLACE(email, '@vitestl.local', '@meridian.local') "
+            "WHERE email LIKE '%@vitestl.local'"
+        )
+        conn.execute(
+            "UPDATE payment_methods SET account_name = 'Meridian Payments' "
+            "WHERE account_name = 'VITESTERTL Payments'"
+        )
 
         _ensure_admin_identity(conn)
         _seed_locations_nodes(conn)
+        _seed_commerce(conn)
+        _ensure_security_settings(conn)
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -333,6 +343,12 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
     _add_column(conn, "users", "totp_secret", "totp_secret TEXT NOT NULL DEFAULT ''")
     _add_column(conn, "users", "totp_enabled", "totp_enabled INTEGER NOT NULL DEFAULT 0")
     _add_column(conn, "users", "totp_last_step", "totp_last_step INTEGER NOT NULL DEFAULT 0")
+    _add_column(conn, "users", "banned", "banned INTEGER NOT NULL DEFAULT 0")
+    _add_column(conn, "users", "banned_at", "banned_at TEXT")
+    _add_column(conn, "users", "ban_reason", "ban_reason TEXT NOT NULL DEFAULT ''")
+    _add_column(conn, "servers", "plan_id", "plan_id INTEGER")
+    _add_column(conn, "servers", "plan_activated_at", "plan_activated_at TEXT")
+    _add_column(conn, "servers", "plan_expires_at", "plan_expires_at TEXT")
     _add_column(conn, "databases", "host_id", "host_id INTEGER")
     _add_column(conn, "databases", "engine", "engine TEXT NOT NULL DEFAULT 'sqlite'")
     conn.execute(
@@ -459,6 +475,146 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            tagline TEXT NOT NULL DEFAULT '',
+            description TEXT NOT NULL DEFAULT '',
+            price_cents INTEGER NOT NULL DEFAULT 0,
+            currency TEXT NOT NULL DEFAULT 'MYR',
+            billing_period TEXT NOT NULL DEFAULT 'month',
+            memory INTEGER NOT NULL DEFAULT 1024,
+            cpu INTEGER NOT NULL DEFAULT 100,
+            disk INTEGER NOT NULL DEFAULT 5120,
+            swap INTEGER NOT NULL DEFAULT 0,
+            io INTEGER NOT NULL DEFAULT 500,
+            server_slots INTEGER NOT NULL DEFAULT 1,
+            database_limit INTEGER NOT NULL DEFAULT 1,
+            backup_limit INTEGER NOT NULL DEFAULT 3,
+            allocation_limit INTEGER NOT NULL DEFAULT 1,
+            features TEXT NOT NULL DEFAULT '[]',
+            artifact TEXT NOT NULL DEFAULT '{}',
+            accent TEXT NOT NULL DEFAULT '#43b8f5',
+            badge TEXT NOT NULL DEFAULT '',
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            featured INTEGER NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS payment_methods (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'manual',
+            account_name TEXT NOT NULL DEFAULT '',
+            account_id TEXT NOT NULL DEFAULT '',
+            qr_image TEXT NOT NULL DEFAULT '',
+            instructions TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE NOT NULL,
+            user_id INTEGER NOT NULL,
+            plan_id INTEGER NOT NULL,
+            payment_method_id INTEGER,
+            server_id TEXT,
+            target_server_id TEXT,
+            server_name TEXT NOT NULL DEFAULT '',
+            egg_id INTEGER,
+            node_id INTEGER,
+            amount_cents INTEGER NOT NULL DEFAULT 0,
+            currency TEXT NOT NULL DEFAULT 'MYR',
+            status TEXT NOT NULL DEFAULT 'pending',
+            reference TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            proof_data TEXT NOT NULL DEFAULT '',
+            admin_note TEXT NOT NULL DEFAULT '',
+            reviewed_by INTEGER,
+            reviewed_at TEXT,
+            terms_accepted INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS redeem_codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE NOT NULL,
+            plan_id INTEGER NOT NULL,
+            max_uses INTEGER NOT NULL DEFAULT 1,
+            uses INTEGER NOT NULL DEFAULT 0,
+            expires_at TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
+            note TEXT NOT NULL DEFAULT '',
+            created_by INTEGER,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS redeem_uses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            order_id INTEGER,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope TEXT NOT NULL DEFAULT 'global',
+            server_id TEXT,
+            egg_id INTEGER,
+            nest_id INTEGER,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'Operations',
+            severity TEXT NOT NULL DEFAULT 'info',
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS security_strikes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            server_id TEXT,
+            source TEXT NOT NULL DEFAULT 'terminal',
+            pattern TEXT NOT NULL,
+            label TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT '',
+            severity TEXT NOT NULL DEFAULT 'critical',
+            snippet TEXT NOT NULL DEFAULT '',
+            action TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_servers_owner ON servers(owner_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_servers_node ON servers(node_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_created ON activity(created_at)")
@@ -482,6 +638,17 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_ai_usage_provider ON ai_usage(provider_id, created_at)"
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_usage_server ON ai_usage(server_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_plan ON orders(plan_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_servers_plan ON servers(plan_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_redeem_uses_code ON redeem_uses(code_id, user_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_redeem_uses_user ON redeem_uses(user_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rules_scope ON rules(scope, sort_order)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rules_server ON rules(server_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rules_egg ON rules(egg_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_security_user ON security_strikes(user_id, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_security_server ON security_strikes(server_id, id)")
 
 
 def sync_catalog(conn: sqlite3.Connection) -> dict[str, int]:
@@ -598,6 +765,328 @@ def _seed_locations_nodes(conn: sqlite3.Connection) -> None:
         )
     conn.execute("UPDATE servers SET node_id = 1 WHERE node_id IS NULL OR node_id = 0")
     conn.execute("UPDATE allocations SET node_id = 1 WHERE node_id IS NULL OR node_id = 0")
+
+
+def _seed_commerce(conn: sqlite3.Connection) -> None:
+    if conn.execute("SELECT COUNT(*) AS c FROM plans").fetchone()["c"] == 0:
+        plans = [
+            {
+                "slug": "starter",
+                "name": "Starter",
+                "tagline": "A clean first deployment",
+                "description": "A focused runtime for one Minecraft world, a small bot or a first service. "
+                "Everything needed to launch, with no unused capacity.",
+                "price_cents": 1500,
+                "memory": 1024,
+                "cpu": 100,
+                "disk": 5120,
+                "database_limit": 1,
+                "backup_limit": 2,
+                "allocation_limit": 1,
+                "server_slots": 1,
+                "features": [
+                    "1 deployment slot",
+                    "1 GB dedicated memory",
+                    "Java or Bedrock runtime",
+                    "DDoS-aware monitoring",
+                    "Daily snapshot window",
+                ],
+                "artifact": {"motif": "foundation", "serial": "ST-01", "caption": "Foundation"},
+                "accent": "#7f95ab",
+                "badge": "Entry",
+                "sort_order": 10,
+                "featured": 0,
+            },
+            {
+                "slug": "standard",
+                "name": "Standard",
+                "tagline": "The working server",
+                "description": "The balanced tier for a live community. More memory, room for plugins and "
+                "scheduled backups without spending on headroom you will not use.",
+                "price_cents": 3500,
+                "memory": 4096,
+                "cpu": 150,
+                "disk": 15360,
+                "database_limit": 2,
+                "backup_limit": 5,
+                "allocation_limit": 2,
+                "server_slots": 2,
+                "features": [
+                    "2 deployment slots",
+                    "4 GB dedicated memory",
+                    "Java and Bedrock ready",
+                    "Modrinth plugin workspace",
+                    "Scheduled backup retention",
+                ],
+                "artifact": {"motif": "orbit", "serial": "SD-02", "caption": "Momentum"},
+                "accent": "#43b8f5",
+                "badge": "Most chosen",
+                "sort_order": 20,
+                "featured": 1,
+            },
+            {
+                "slug": "pro",
+                "name": "Pro",
+                "tagline": "Built for busy worlds",
+                "description": "Performance headroom for modpacks, larger player counts and parallel services. "
+                "Tuned for operators who watch their telemetry.",
+                "price_cents": 6900,
+                "memory": 8192,
+                "cpu": 250,
+                "disk": 30720,
+                "database_limit": 4,
+                "backup_limit": 10,
+                "allocation_limit": 3,
+                "server_slots": 4,
+                "features": [
+                    "4 deployment slots",
+                    "8 GB dedicated memory",
+                    "Performance-tuned node placement",
+                    "Advanced schedule automation",
+                    "Extended backup retention",
+                ],
+                "artifact": {"motif": "lattice", "serial": "PR-03", "caption": "Velocity"},
+                "accent": "#aa9bf5",
+                "badge": "Performance",
+                "sort_order": 30,
+                "featured": 0,
+            },
+            {
+                "slug": "premium",
+                "name": "Premium",
+                "tagline": "Your flagship estate",
+                "description": "Maximum capacity and white-glove onboarding for a network of worlds, events and "
+                "production services that cannot wait for capacity.",
+                "price_cents": 12900,
+                "memory": 16384,
+                "cpu": 400,
+                "disk": 61440,
+                "database_limit": 8,
+                "backup_limit": 20,
+                "allocation_limit": 5,
+                "server_slots": 8,
+                "features": [
+                    "8 deployment slots",
+                    "16 GB dedicated memory",
+                    "Priority node placement",
+                    "Migration and launch assistance",
+                    "Concierge support channel",
+                ],
+                "artifact": {"motif": "crest", "serial": "PM-04", "caption": "Flagship"},
+                "accent": "#e3b664",
+                "badge": "Flagship",
+                "sort_order": 40,
+                "featured": 0,
+            },
+        ]
+        stamp = utcnow()
+        for plan in plans:
+            conn.execute(
+                """INSERT INTO plans
+                (slug, name, tagline, description, price_cents, currency, billing_period,
+                 memory, cpu, disk, swap, io, server_slots, database_limit, backup_limit,
+                 allocation_limit, features, artifact, accent, badge, sort_order, featured,
+                 active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'MYR', 'month', ?, ?, ?, 0, 500, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+                (
+                    plan["slug"],
+                    plan["name"],
+                    plan["tagline"],
+                    plan["description"],
+                    plan["price_cents"],
+                    plan["memory"],
+                    plan["cpu"],
+                    plan["disk"],
+                    plan["server_slots"],
+                    plan["database_limit"],
+                    plan["backup_limit"],
+                    plan["allocation_limit"],
+                    json.dumps(plan["features"]),
+                    json.dumps(plan["artifact"]),
+                    plan["accent"],
+                    plan["badge"],
+                    plan["sort_order"],
+                    plan["featured"],
+                    stamp,
+                    stamp,
+                ),
+            )
+
+    if conn.execute("SELECT COUNT(*) AS c FROM payment_methods").fetchone()["c"] == 0:
+        methods = [
+            {
+                "name": "DANA QR",
+                "kind": "dana_qr",
+                "account_name": "Meridian Payments",
+                "account_id": "",
+                "qr_image": "",
+                "instructions": "Open DANA, choose Scan QR, and send the exact order total. "
+                "Upload the receipt in the checkout form and keep the order code as your reference.",
+                "sort_order": 10,
+            },
+            {
+                "name": "DANA account",
+                "kind": "dana_account",
+                "account_name": "Meridian Payments",
+                "account_id": "",
+                "qr_image": "",
+                "instructions": "Transfer the exact total to the DANA account shown above. "
+                "Use the order code as the transfer note, then attach the receipt.",
+                "sort_order": 20,
+            },
+            {
+                "name": "Touch 'n Go QR",
+                "kind": "tng_qr",
+                "account_name": "Meridian Payments",
+                "account_id": "",
+                "qr_image": "",
+                "instructions": "Open Touch 'n Go eWallet, choose Scan QR, and send the exact order total. "
+                "Attach the receipt so the owner can verify the payment.",
+                "sort_order": 30,
+            },
+            {
+                "name": "Touch 'n Go account",
+                "kind": "tng_account",
+                "account_name": "Meridian Payments",
+                "account_id": "",
+                "qr_image": "",
+                "instructions": "Transfer the exact total to the Touch 'n Go eWallet number above. "
+                "Enter the order code as the reference and attach the receipt.",
+                "sort_order": 40,
+            },
+            {
+                "name": "Manual bank transfer",
+                "kind": "bank_transfer",
+                "account_name": "Meridian Payments",
+                "account_id": "",
+                "qr_image": "",
+                "instructions": "Use the bank details published by the owner. "
+                "Include the order code in the transfer note and attach the receipt.",
+                "sort_order": 50,
+            },
+        ]
+        stamp = utcnow()
+        for method in methods:
+            conn.execute(
+                """INSERT INTO payment_methods
+                (name, kind, account_name, account_id, qr_image, instructions, enabled,
+                 sort_order, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)""",
+                (
+                    method["name"],
+                    method["kind"],
+                    method["account_name"],
+                    method["account_id"],
+                    method["qr_image"],
+                    method["instructions"],
+                    method["sort_order"],
+                    stamp,
+                    stamp,
+                ),
+            )
+
+    if conn.execute("SELECT COUNT(*) AS c FROM rules").fetchone()["c"] == 0:
+        stamp = utcnow()
+        rules = [
+            {
+                "scope": "global",
+                "title": "Zero tolerance for network abuse",
+                "body": "Do not launch DDoS tooling, traffic flood scripts, unauthorised port scans or stress "
+                "tests against any target. The panel blocks known attack code, immediately suspends the "
+                "deployment on critical findings and bans accounts after four recorded attempts.",
+                "category": "Security",
+                "severity": "critical",
+                "sort_order": 10,
+            },
+            {
+                "scope": "global",
+                "title": "Protect account and payment details",
+                "body": "Never share your panel password, two-factor codes, API keys or payment receipt with "
+                "another person. The owner will never ask for your password in chat.",
+                "category": "Account",
+                "severity": "warning",
+                "sort_order": 20,
+            },
+            {
+                "scope": "global",
+                "title": "Keep changes recoverable",
+                "body": "Create a backup before replacing a world, upgrading a major version or changing a "
+                "startup command. The panel records every destructive action in the activity log.",
+                "category": "Operations",
+                "severity": "info",
+                "sort_order": 30,
+            },
+            {
+                "scope": "global",
+                "title": "Respect capacity and neighbours",
+                "body": "Stay within the memory, CPU and disk limits shown on your plan. Sustained abuse of "
+                "shared nodes can lead to throttling, suspension or a plan review.",
+                "category": "Fair use",
+                "severity": "warning",
+                "sort_order": 40,
+            },
+            {
+                "scope": "nest",
+                "nest_id": 6,
+                "title": "Minecraft content policy",
+                "body": "Install plugins, mods and packs from sources you trust. Do not distribute malware, "
+                "griefing tools, credential stealers or content that breaks the Minecraft EULA.",
+                "category": "Minecraft",
+                "severity": "warning",
+                "sort_order": 10,
+            },
+            {
+                "scope": "egg",
+                "egg_id": 27,
+                "title": "Java editions and plugin integrity",
+                "body": "Use the built-in installer or verified Modrinth projects. Test major version upgrades "
+                "on a backup, and keep the EULA acknowledgement current for the account that operates the server.",
+                "category": "Minecraft Java",
+                "severity": "info",
+                "sort_order": 20,
+            },
+            {
+                "scope": "egg",
+                "egg_id": 28,
+                "title": "Bedrock compatibility",
+                "body": "Bedrock packs, behaviour packs and scripts must match the installed server version. "
+                "Remove incompatible packs before a version change rather than disabling the safety checks.",
+                "category": "Minecraft Bedrock",
+                "severity": "info",
+                "sort_order": 30,
+            },
+        ]
+        for rule in rules:
+            conn.execute(
+                """INSERT INTO rules
+                (scope, server_id, egg_id, nest_id, title, body, category, severity,
+                 sort_order, enabled, created_at, updated_at)
+                VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+                (
+                    rule["scope"],
+                    rule.get("egg_id"),
+                    rule.get("nest_id"),
+                    rule["title"],
+                    rule["body"],
+                    rule["category"],
+                    rule["severity"],
+                    rule["sort_order"],
+                    stamp,
+                    stamp,
+                ),
+            )
+
+
+def _ensure_security_settings(conn: sqlite3.Connection) -> None:
+    defaults = {
+        "security_detection": "true",
+        "security_auto_suspend": "true",
+        "security_ban_threshold": "4",
+    }
+    for key, value in defaults.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value)
+        )
 
 
 def hostname_safe() -> str:

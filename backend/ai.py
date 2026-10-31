@@ -1,4 +1,4 @@
-"""Provider-neutral AI clients for the VITESTERTL operations copilot.
+"""Provider-neutral AI clients for the Meridian operations copilot.
 
 The panel deliberately speaks the native wire formats used by the major
 provider families instead of depending on a vendor SDK:
@@ -23,7 +23,7 @@ from urllib.parse import quote
 
 import httpx
 
-PANEL_USER_AGENT = "VITESTERTL-Panel/2.1"
+PANEL_USER_AGENT = "Meridian-Panel/2.1"
 AI_KINDS = ("openai", "anthropic", "google", "azure", "ollama")
 
 AI_PRESETS: list[dict[str, Any]] = [

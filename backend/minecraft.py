@@ -37,7 +37,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-USER_AGENT = "VITESTERTL/2.0.0 (Minecraft provisioning; +https://github.com/vitestl)"
+USER_AGENT = "Meridian/2.0.0 (Minecraft provisioning; +https://github.com/vitestl)"
 HTTP_TIMEOUT = 30
 DOWNLOAD_TIMEOUT = 60
 DOWNLOAD_ATTEMPTS = 4
@@ -1234,7 +1234,7 @@ if [ ! -f user_jvm_args.txt ]; then
   printf -- "-Xms%sM\\n-Xmx%sM\\n" "$MEM" "$MEM" > user_jvm_args.txt
 fi
 if [ ! -f run.sh ]; then
-  echo "[vitestl] first start: installing {flavour} server libraries"
+  echo "[meridian] first start: installing {flavour} server libraries"
   java -jar "{installer_name}" --installServer
 fi
 exec bash run.sh nogui
@@ -1578,7 +1578,7 @@ def _write_properties(path: Path, updates: dict[str, str]) -> None:
         except OSError:
             pass
     existing.update(updates)
-    lines = ["# Minecraft server properties managed by VITESTERTL"]
+    lines = ["# Minecraft server properties managed by Meridian"]
     if comments:
         lines.extend(comments[:20])
     for key in order:
@@ -1598,7 +1598,7 @@ def _base_properties(
 ) -> dict[str, str]:
     if meta["id"] == "bedrock":
         values = {
-            "server-name": overrides.get("motd", overrides.get("server-name", "VITESTERTL Bedrock")),
+            "server-name": overrides.get("motd", overrides.get("server-name", "Meridian Bedrock")),
             "server-port": str(port),
             "server-portv6": "19133",
             "max-players": overrides.get("max-players", "20"),
@@ -1621,7 +1621,7 @@ def _base_properties(
     return {
         "server-port": str(port),
         "server-ip": "0.0.0.0",
-        "motd": overrides.get("motd", f"{meta['name']} on VITESTERTL"),
+        "motd": overrides.get("motd", f"{meta['name']} on Meridian"),
         "max-players": overrides.get("max-players", "20"),
         "gamemode": overrides.get("gamemode", "survival"),
         "difficulty": overrides.get("difficulty", "easy"),
@@ -1761,7 +1761,7 @@ def install_server(
             current = _read_properties(eula_path).get("eula", "").lower()
             eula_value = current == "true"
         eula_path.write_text(
-            f"# Set by the VITESTERTL Minecraft installer\n"
+            f"# Set by the Meridian Minecraft installer\n"
             f"# https://aka.ms/MinecraftEULA\n"
             f"eula={'true' if eula_value else 'false'}\n",
             encoding="utf-8",
@@ -1788,7 +1788,7 @@ def install_server(
         _log(log, "Applied server.properties with the allocation port")
 
     metadata = {
-        "panel": "vitestl",
+        "panel": "meridian",
         "software": meta["id"],
         "software_name": meta["name"],
         "edition": meta["edition"],
@@ -1799,7 +1799,7 @@ def install_server(
         "port": port,
         "installed_at": _now(),
     }
-    (path / ".vitestl-minecraft.json").write_text(
+    (path / ".meridian-minecraft.json").write_text(
         json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
     )
     _log(log, f"Installation complete: {meta['name']} {resolved_version}")
@@ -1813,14 +1813,19 @@ def install_server(
 
 
 def read_install_metadata(root: str | Path) -> dict[str, Any]:
-    path = Path(root) / ".vitestl-minecraft.json"
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
+    base = Path(root)
+    # Installations created before the Meridian rename keep their original
+    # manifest name; read it as a fallback so upgrades preserve the install.
+    for name in (".meridian-minecraft.json", ".vitestl-minecraft.json"):
+        path = base / name
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            continue
+    return {}
 
 
 # ---------------------------------------------------------------------------

@@ -23,8 +23,8 @@ NODES_DIR.mkdir(parents=True, exist_ok=True)
 
 SECRET = os.environ.get("KESTREL_SECRET", "kestrel-control-plane-dev-secret")
 TOKEN_TTL = 60 * 60 * 24 * 7
-PANEL_NAME = "VITESTERTL"
-PANEL_COMPANY = "VITESTERTL"
+PANEL_NAME = "Meridian"
+PANEL_COMPANY = "Meridian Host"
 PANEL_VERSION = "2.1.0"
 WINGS_VERSION = "2.1.0"
 ALLOC_PORT_START = 9000
@@ -32,7 +32,7 @@ ALLOC_PORT_END = 9999
 
 DEFAULT_ADMIN_USER = os.environ.get("KESTREL_ADMIN_USER", "Yanxzyx")
 DEFAULT_ADMIN_PASS = os.environ.get("KESTREL_ADMIN_PASS", "Kestrel.admin1")
-DEFAULT_ADMIN_EMAIL = os.environ.get("KESTREL_ADMIN_EMAIL", "yanxzyx@vitestl.local")
+DEFAULT_ADMIN_EMAIL = os.environ.get("KESTREL_ADMIN_EMAIL", "yanxzyx@meridian.local")
 
 
 def hostname() -> str:

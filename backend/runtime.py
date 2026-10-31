@@ -135,7 +135,7 @@ class Instance:
                     code = await proc.wait()
                 except Exception:
                     code = -1
-            self.emit(f"[vitestl] process exited with code {code}")
+            self.emit(f"[meridian] process exited with code {code}")
             self.status = "offline"
             self.pid = None
             self.ps = None
@@ -146,14 +146,14 @@ class Instance:
             if self.proc and self.proc.returncode is None:
                 return
             self.status = "starting"
-            self.emit("[vitestl] starting instance...")
+            self.emit("[meridian] starting instance...")
             cwd = self.cwd()
             cwd.mkdir(parents=True, exist_ok=True)
             env = self.build_env()
             command = self.startup_command()
             if not command.strip():
                 self.status = "offline"
-                self.emit("[vitestl] abort: empty startup command")
+                self.emit("[meridian] abort: empty startup command")
                 raise RuntimeError("Empty startup command")
 
             prefer_docker = self.server.get("egg_runtime") == "docker" or self.server.get("runtime") == "docker"
@@ -162,12 +162,12 @@ class Instance:
                 await self._start_docker(command, env, cwd)
             else:
                 if prefer_docker and not docker_available():
-                    self.emit("[vitestl] docker engine unavailable on this node; using process runtime")
+                    self.emit("[meridian] docker engine unavailable on this node; using process runtime")
                 await self._start_process(command, env, cwd)
 
             self.started_at = time.time()
             self.status = "running"
-            self.emit(f"[vitestl] online  pid={self.pid}  mode={self.mode}  cmd={command}")
+            self.emit(f"[meridian] online  pid={self.pid}  mode={self.mode}  cmd={command}")
 
     async def _start_process(self, command: str, env: dict[str, str], cwd: Path) -> None:
         self.mode = "process"
@@ -192,7 +192,7 @@ class Instance:
 
     async def _start_docker(self, command: str, env: dict[str, str], cwd: Path) -> None:
         self.mode = "docker"
-        name = f"vitestl-{self.server_id[:8]}"
+        name = f"meridian-{self.server_id[:8]}"
         self.docker_name = name
         image = env.get("IMAGE") or self.server.get("image") or "python:3.11-slim"
         port = self.server["allocation_port"]
@@ -216,7 +216,7 @@ class Instance:
             docker_cmd.extend(["-e", f"{key}={env.get(key, '')}"])
         docker_cmd.append(image)
         docker_cmd.extend(["/bin/sh", "-lc", command])
-        self.emit("[vitestl] docker " + " ".join(shlex.quote(p) for p in docker_cmd))
+        self.emit("[meridian] docker " + " ".join(shlex.quote(p) for p in docker_cmd))
         self.proc = await asyncio.create_subprocess_exec(
             *docker_cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -248,7 +248,7 @@ class Instance:
                 self.status = "offline"
                 return
             self.status = "stopping"
-            self.emit("[vitestl] stopping instance...")
+            self.emit("[meridian] stopping instance...")
             pid = self.proc.pid
             try:
                 os.killpg(pid, signal.SIGKILL if kill else signal.SIGTERM)
@@ -279,7 +279,7 @@ class Instance:
             self.status = "offline"
             self.pid = None
             self.ps = None
-            self.emit("[vitestl] instance offline")
+            self.emit("[meridian] instance offline")
 
     def stats(self) -> dict[str, Any]:
         cpu = 0.0

@@ -91,6 +91,12 @@ from db import (
     utcnow,
 )
 from eggs import NESTS, EGGS, default_egg_files, egg_by_id
+from security_scan import (
+    critical_finding,
+    scan_dangerous_activity,
+    summary as security_summary,
+    is_text_candidate,
+)
 from minecraft import MinecraftError
 from minecraft import catalog as minecraft_catalog
 from minecraft import check_update as minecraft_check_update
@@ -463,6 +469,101 @@ class TagsBody(BaseModel):
     tags: list[str] = []
 
 
+class OrderBody(BaseModel):
+    plan_id: int
+    payment_method_id: int
+    server_name: str = ""
+    egg_id: int | None = None
+    target_server_id: str | None = None
+    reference: str = ""
+    notes: str = ""
+    proof_data: str = ""
+    terms_accepted: bool = False
+
+
+class OrderProofBody(BaseModel):
+    reference: str = ""
+    notes: str = ""
+    proof_data: str = ""
+
+
+class OrderRejectBody(BaseModel):
+    reason: str = ""
+
+
+class PlanBody(BaseModel):
+    name: str
+    slug: str = ""
+    tagline: str = ""
+    description: str = ""
+    price_cents: int = 0
+    currency: str = "MYR"
+    billing_period: str = "month"
+    memory: int = 1024
+    cpu: int = 100
+    disk: int = 5120
+    swap: int = 0
+    io: int = 500
+    server_slots: int = 1
+    database_limit: int = 1
+    backup_limit: int = 3
+    allocation_limit: int = 1
+    features: list[str] = []
+    artifact: dict[str, Any] = {}
+    accent: str = "#43b8f5"
+    badge: str = ""
+    sort_order: int = 0
+    featured: bool = False
+    active: bool = True
+
+
+class PaymentMethodBody(BaseModel):
+    name: str
+    kind: str = "manual"
+    account_name: str = ""
+    account_id: str = ""
+    qr_image: str = ""
+    instructions: str = ""
+    enabled: bool = True
+    sort_order: int = 0
+
+
+class RedeemCodeBody(BaseModel):
+    plan_id: int
+    code: str = ""
+    max_uses: int = 1
+    expires_at: str | None = None
+    note: str = ""
+    active: bool = True
+
+
+class RedeemBody(BaseModel):
+    code: str
+    server_name: str = ""
+    egg_id: int | None = None
+    target_server_id: str | None = None
+    terms_accepted: bool = False
+
+
+class RuleBody(BaseModel):
+    scope: str = "global"
+    server_id: str | None = None
+    egg_id: int | None = None
+    nest_id: int | None = None
+    title: str
+    body: str
+    category: str = "Operations"
+    severity: str = "info"
+    sort_order: int = 0
+    enabled: bool = True
+
+
+class SecuritySettingsBody(BaseModel):
+    detection: bool | None = None
+    auto_suspend: bool | None = None
+    ban_threshold: int | None = None
+
+
 def load_egg(egg_id: int) -> dict[str, Any] | None:
     with db() as conn:
         row = conn.execute("SELECT * FROM eggs WHERE id = ?", (egg_id,)).fetchone()
@@ -520,6 +621,15 @@ def hash_api_key(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def ensure_account_active(user: dict[str, Any]) -> None:
+    if user.get("banned"):
+        reason = str(user.get("ban_reason") or "").strip()
+        detail = "This account is suspended for repeated dangerous activity."
+        if reason:
+            detail = f"{detail} {reason}"
+        raise HTTPException(403, detail)
+
+
 def user_from_header(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "Unauthenticated")
@@ -537,6 +647,7 @@ def user_from_header(authorization: str | None = Header(default=None)) -> dict[s
         user = row_to_dict(row)
         if not user:
             raise HTTPException(401, "User missing")
+        ensure_account_active(user)
         user.pop("password_hash", None)
         user["api_key_id"] = key["id"]
         return user
@@ -548,6 +659,7 @@ def user_from_header(authorization: str | None = Header(default=None)) -> dict[s
     user = row_to_dict(row)
     if not user:
         raise HTTPException(401, "User missing")
+    ensure_account_active(user)
     user.pop("password_hash", None)
     return user
 
@@ -743,6 +855,9 @@ def public_user(user: dict[str, Any]) -> dict[str, Any]:
         "last_login": user.get("last_login"),
         "root_admin": user.get("role") == "admin",
         "two_factor_enabled": bool(user.get("totp_enabled")),
+        "banned": bool(user.get("banned")),
+        "banned_at": user.get("banned_at"),
+        "ban_reason": user.get("ban_reason") or "",
     }
 
 
@@ -895,8 +1010,8 @@ def terminal_environment(root: Path, server_id: str, server_name: str) -> dict[s
                 "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
             ),
             "HOME": str(root),
-            "USER": os.environ.get("USER", "vitestl"),
-            "LOGNAME": os.environ.get("LOGNAME") or os.environ.get("USER", "vitestl"),
+            "USER": os.environ.get("USER", "meridian"),
+            "LOGNAME": os.environ.get("LOGNAME") or os.environ.get("USER", "meridian"),
             "LANG": os.environ.get("LANG", "C.UTF-8"),
             "TERM": "xterm-256color",
         }
@@ -1070,7 +1185,7 @@ def decorate_node(node: dict[str, Any], conn) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Local node auto-installer
 #
-# VITESTERTL executes workloads on the panel host. The installer therefore
+# Meridian executes workloads on the panel host. The installer therefore
 # provisions the local host as a first-class node: it audits the Debian runtime,
 # registers the node, reserves allocations, and writes a node manifest. It never
 # pretends to install a remote agent and it never runs package managers from the
@@ -1264,13 +1379,13 @@ def _host_audit() -> dict[str, Any]:
             (row["name"] or "").strip().lower()
             for row in conn.execute("SELECT name FROM nodes").fetchall()
         }
-        recommendation_name = "vitestl-local"
+        recommendation_name = "meridian-local"
         if existing:
             recommendation_name = existing["name"]
         else:
             suffix = 2
             while recommendation_name.lower() in names:
-                recommendation_name = f"vitestl-local-{suffix}"
+                recommendation_name = f"meridian-local-{suffix}"
                 suffix += 1
         recommended_ports = _find_port_block(conn, ALLOC_PORT_START, 10)
         allocation_count = 0
@@ -1322,7 +1437,7 @@ def _host_audit() -> dict[str, Any]:
             "label": "Service privileges",
             "status": "ok" if root else "warn",
             "detail": "Running as root" if root else "Running as an unprivileged user",
-            "hint": "The panel should run as the vitestl service account; root is only needed for setup.",
+            "hint": "The panel should run under its dedicated service account; root is only needed for setup.",
         },
         {
             "id": "storage",
@@ -2012,6 +2127,24 @@ def _server_mc_payload(server: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def plan_feature_limits(plan: dict[str, Any] | None) -> dict[str, int]:
+    return {
+        "databases": int(plan["database_limit"]) if plan else SERVER_DATABASE_LIMIT,
+        "allocations": int(plan["allocation_limit"]) if plan else 1,
+        "backups": int(plan["backup_limit"]) if plan else 8,
+    }
+
+
+def plan_limits_for_server(server: dict[str, Any]) -> dict[str, int]:
+    plan = None
+    if server.get("plan_id"):
+        with db() as conn:
+            plan = plan_public(
+                conn.execute("SELECT * FROM plans WHERE id = ?", (server["plan_id"],)).fetchone()
+            )
+    return plan_feature_limits(plan)
+
+
 def decorate_server(server: dict[str, Any]) -> dict[str, Any]:
     sid = server["id"]
     inst = manager.instances.get(sid)
@@ -2034,6 +2167,19 @@ def decorate_server(server: dict[str, Any]) -> dict[str, Any]:
         except json.JSONDecodeError:
             env = {}
     tags = parse_tags(server.get("tags"))
+    plan = None
+    plan_state = "none"
+    if server.get("plan_id"):
+        with db() as conn:
+            plan = plan_public(
+                conn.execute("SELECT * FROM plans WHERE id = ?", (server["plan_id"],)).fetchone()
+            )
+        if plan:
+            expires = _parse_utc(server.get("plan_expires_at"))
+            plan_state = "active"
+            if expires is not None and expires <= datetime.now(timezone.utc):
+                plan_state = "expired"
+    feature_limits = plan_feature_limits(plan)
     return {
         **{k: server[k] for k in server if k not in ("environment", "tags")},
         "environment": env or {},
@@ -2055,7 +2201,11 @@ def decorate_server(server: dict[str, Any]) -> dict[str, Any]:
             "io": server.get("io"),
         },
         "resources": stats,
-        "feature_limits": {"databases": SERVER_DATABASE_LIMIT, "allocations": 1, "backups": 8},
+        "plan": plan,
+        "plan_state": plan_state,
+        "plan_activated_at": server.get("plan_activated_at"),
+        "plan_expires_at": server.get("plan_expires_at"),
+        "feature_limits": feature_limits,
     }
 
 
@@ -2076,6 +2226,738 @@ def safe_join(server_id: str, rel: str) -> Path:
     if root not in target.parents and target != root:
         raise HTTPException(400, "Path escapes server directory")
     return target
+
+
+# ---------------------------------------------------------------------------
+# Commerce: plans, payment methods, manual orders and redeem codes
+# ---------------------------------------------------------------------------
+
+ORDER_STATUSES = {"pending", "approved", "rejected", "cancelled"}
+PAYMENT_METHOD_KINDS = {
+    "dana_qr",
+    "dana_account",
+    "tng_qr",
+    "tng_account",
+    "bank_transfer",
+    "manual",
+}
+REVIEWING_ORDERS: set[int] = set()
+
+ORDER_SELECT = """
+    SELECT o.*,
+           p.name AS plan_name, p.slug AS plan_slug, p.accent AS plan_accent,
+           p.badge AS plan_badge, p.price_cents AS plan_price,
+           p.memory AS plan_memory, p.cpu AS plan_cpu, p.disk AS plan_disk,
+           p.features AS plan_features, p.currency AS plan_currency,
+           pm.name AS method_name, pm.kind AS method_kind,
+           pm.account_name AS method_account_name, pm.account_id AS method_account_id,
+           pm.qr_image AS method_qr_image, pm.instructions AS method_instructions,
+           u.username AS buyer_username, u.email AS buyer_email,
+           ts.name AS target_server_name, srv.name AS provisioned_server_name
+    FROM orders o
+    LEFT JOIN plans p ON p.id = o.plan_id
+    LEFT JOIN payment_methods pm ON pm.id = o.payment_method_id
+    LEFT JOIN users u ON u.id = o.user_id
+    LEFT JOIN servers ts ON ts.id = o.target_server_id
+    LEFT JOIN servers srv ON srv.id = o.server_id
+"""
+
+
+def _json_value(raw: Any, fallback: Any) -> Any:
+    if isinstance(raw, (list, dict)):
+        return raw
+    try:
+        value = json.loads(raw or "")
+    except (TypeError, json.JSONDecodeError):
+        return fallback
+    return value if isinstance(value, type(fallback)) else fallback
+
+
+def plan_public(row: Any) -> dict[str, Any] | None:
+    data = row_to_dict(row) if not isinstance(row, dict) else dict(row)
+    if not data:
+        return None
+    data["features"] = [str(item)[:160] for item in _json_value(data.get("features"), [])][:16]
+    data["artifact"] = _json_value(data.get("artifact"), {})
+    data["price_cents"] = max(0, int(data.get("price_cents") or 0))
+    data["memory"] = max(32, int(data.get("memory") or 32))
+    data["cpu"] = max(10, int(data.get("cpu") or 10))
+    data["disk"] = max(128, int(data.get("disk") or 128))
+    data["server_slots"] = max(1, int(data.get("server_slots") or 1))
+    data["database_limit"] = max(0, int(data.get("database_limit") or 0))
+    data["backup_limit"] = max(0, int(data.get("backup_limit") or 0))
+    data["allocation_limit"] = max(1, int(data.get("allocation_limit") or 1))
+    data["featured"] = bool(data.get("featured"))
+    data["active"] = bool(data.get("active"))
+    return data
+
+
+def payment_method_public(row: Any) -> dict[str, Any] | None:
+    data = row_to_dict(row) if not isinstance(row, dict) else dict(row)
+    if not data:
+        return None
+    data["enabled"] = bool(data.get("enabled"))
+    data["qr_configured"] = bool(str(data.get("qr_image") or "").strip())
+    data["account_configured"] = bool(str(data.get("account_id") or "").strip())
+    data["configured"] = payment_method_ready(data)
+    return data
+
+
+def payment_method_ready(method: dict[str, Any]) -> bool:
+    kind = str(method.get("kind") or "manual")
+    if kind in ("dana_qr", "tng_qr"):
+        return bool(str(method.get("qr_image") or "").strip())
+    if kind in ("dana_account", "tng_account", "bank_transfer"):
+        return bool(str(method.get("account_id") or "").strip())
+    return bool(str(method.get("instructions") or "").strip())
+
+
+def order_payload(row: Any) -> dict[str, Any] | None:
+    data = row_to_dict(row) if not isinstance(row, dict) else dict(row)
+    if not data:
+        return None
+    plan = None
+    if data.get("plan_name"):
+        plan = {
+            "id": data.get("plan_id"),
+            "name": data.get("plan_name"),
+            "slug": data.get("plan_slug") or "",
+            "accent": data.get("plan_accent") or "#43b8f5",
+            "badge": data.get("plan_badge") or "",
+            "price_cents": int(data.get("plan_price") or 0),
+            "currency": data.get("plan_currency") or data.get("currency") or "MYR",
+            "memory": int(data.get("plan_memory") or 0),
+            "cpu": int(data.get("plan_cpu") or 0),
+            "disk": int(data.get("plan_disk") or 0),
+            "features": _json_value(data.get("plan_features"), []),
+        }
+    method = None
+    if data.get("method_name"):
+        method = {
+            "id": data.get("payment_method_id"),
+            "name": data.get("method_name"),
+            "kind": data.get("method_kind") or "manual",
+            "account_name": data.get("method_account_name") or "",
+            "account_id": data.get("method_account_id") or "",
+            "qr_image": data.get("method_qr_image") or "",
+            "instructions": data.get("method_instructions") or "",
+        }
+    return {
+        "id": data.get("id"),
+        "code": data.get("code"),
+        "user_id": data.get("user_id"),
+        "buyer": {
+            "username": data.get("buyer_username") or "",
+            "email": data.get("buyer_email") or "",
+        },
+        "plan_id": data.get("plan_id"),
+        "plan": plan,
+        "payment_method_id": data.get("payment_method_id"),
+        "payment_method": method,
+        "server_id": data.get("server_id"),
+        "target_server_id": data.get("target_server_id"),
+        "target_server_name": data.get("target_server_name") or "",
+        "provisioned_server_name": data.get("provisioned_server_name") or "",
+        "server_name": data.get("server_name") or "",
+        "egg_id": data.get("egg_id"),
+        "amount_cents": int(data.get("amount_cents") or 0),
+        "currency": data.get("currency") or "MYR",
+        "status": data.get("status") or "pending",
+        "reference": data.get("reference") or "",
+        "notes": data.get("notes") or "",
+        "proof_data": data.get("proof_data") or "",
+        "admin_note": data.get("admin_note") or "",
+        "terms_accepted": bool(data.get("terms_accepted")),
+        "reviewed_by": data.get("reviewed_by"),
+        "reviewed_at": data.get("reviewed_at"),
+        "created_at": data.get("created_at"),
+        "updated_at": data.get("updated_at"),
+    }
+
+
+def new_order_code(conn: Any) -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    for _ in range(20):
+        code = f"MDN-{stamp}-{secrets.token_hex(2).upper()}"
+        if not conn.execute("SELECT id FROM orders WHERE code = ?", (code,)).fetchone():
+            return code
+    return f"MDN-{stamp}-{secrets.token_hex(3).upper()}"
+
+
+def normalize_redeem_code(value: str) -> str:
+    cleaned = re.sub(r"[^A-Z0-9-]", "", (value or "").upper())
+    cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-")
+    return cleaned[:48]
+
+
+def validate_proof_data(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    if len(raw) > 2_800_000:
+        raise HTTPException(400, "The payment receipt is too large. Use an image under 2 MB.")
+    if not re.match(r"^data:image/(?:png|jpe?g|webp);base64,", raw, re.IGNORECASE):
+        raise HTTPException(400, "The payment receipt must be a PNG, JPEG or WebP image.")
+    return raw
+
+
+def validate_qr_image(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    if len(raw) > 3_500_000:
+        raise HTTPException(400, "The QR image is too large. Use an image under 2.5 MB.")
+    if raw.startswith("data:image/"):
+        if not re.match(r"^data:image/(?:png|jpe?g|webp);base64,", raw, re.IGNORECASE):
+            raise HTTPException(400, "QR images must be PNG, JPEG or WebP")
+        return raw
+    if not re.match(r"^https?://", raw, re.IGNORECASE):
+        raise HTTPException(400, "Use an https image URL or upload a PNG, JPEG or WebP file")
+    return raw[:2000]
+
+
+def get_plan(conn: Any, plan_id: int, active_only: bool = True) -> dict[str, Any]:
+    row = conn.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+    plan = plan_public(row)
+    if not plan or (active_only and not plan.get("active")):
+        raise HTTPException(404, "This plan is not available")
+    return plan
+
+
+def get_order(conn: Any, order_id: int) -> dict[str, Any]:
+    row = conn.execute(ORDER_SELECT + " WHERE o.id = ?", (order_id,)).fetchone()
+    payload = order_payload(row)
+    if not payload:
+        raise HTTPException(404, "Order not found")
+    return payload
+
+
+def order_egg(egg_id: int | None) -> dict[str, Any]:
+    if not egg_id:
+        raise HTTPException(400, "Choose a workload template for the new server")
+    egg = resolve_egg(int(egg_id))
+    if not egg:
+        raise HTTPException(400, "Unknown workload template")
+    return egg
+
+
+def select_plan_node(conn: Any, plan: dict[str, Any]) -> dict[str, Any]:
+    rows = rows_to_list(
+        conn.execute(
+            """SELECT n.*,
+                      COALESCE(SUM(s.memory), 0) AS used_memory,
+                      COALESCE(SUM(s.disk), 0) AS used_disk,
+                      COUNT(s.id) AS server_count
+               FROM nodes n
+               LEFT JOIN servers s ON s.node_id = n.id
+               WHERE n.maintenance = 0
+               GROUP BY n.id
+               ORDER BY used_memory ASC, n.id ASC"""
+        ).fetchall()
+    )
+    for node in rows:
+        memory_limit = int(node.get("memory") or 0) * (
+            1 + int(node.get("memory_overallocate") or 0) / 100
+        )
+        disk_limit = int(node.get("disk") or 0) * (
+            1 + int(node.get("disk_overallocate") or 0) / 100
+        )
+        if int(node["used_memory"]) + int(plan["memory"]) > memory_limit:
+            continue
+        if int(node["used_disk"]) + int(plan["disk"]) > disk_limit:
+            continue
+        return node
+    raise HTTPException(
+        400,
+        "No node currently has enough capacity for this plan. The owner has been "
+        "notified through the pending order; try again after capacity is added.",
+    )
+
+
+def plan_expiry(days: int = 30) -> str:
+    return (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+async def provision_order_server(
+    order: dict[str, Any], plan: dict[str, Any], actor_id: int | None
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Create a server from an approved order. Returns (server_row, mc_job)."""
+
+    with db() as conn:
+        user = row_to_dict(
+            conn.execute("SELECT * FROM users WHERE id = ?", (order["user_id"],)).fetchone()
+        )
+        if not user:
+            raise HTTPException(400, "The buyer account no longer exists")
+        if user.get("banned"):
+            raise HTTPException(400, "Unban the buyer before approving this order")
+        # Re-check capacity at approval time. Several pending orders can pass the
+        # checkout check before any of them provisions a server.
+        assert_new_server_capacity(conn, user, plan)
+        egg = order_egg(order.get("egg_id"))
+        node = select_plan_node(conn, plan)
+        node_id = int(node["id"])
+        sid, short = new_server_id()
+        port = next_port(conn)
+        alloc_ip = "0.0.0.0"
+        conn.execute(
+            "INSERT INTO allocations (ip, port, server_id, notes, node_id) VALUES (?, ?, ?, 'primary', ?)",
+            (alloc_ip, port, sid, node_id),
+        )
+        name = (order.get("server_name") or plan["name"] + " deployment").strip()[:80]
+        env = {
+            "SERVER_NAME": name,
+            "SERVER_PORT": str(port),
+            "SERVER_MEMORY": str(plan["memory"]),
+            "SERVER_IP": alloc_ip,
+            "IMAGE": egg["docker_image"],
+        }
+        for var in egg.get("variables") or []:
+            env.setdefault(var["env"], var.get("default") or "")
+        if int(egg["id"]) in (27, 28):
+            env.setdefault("MC_SOFTWARE", "bedrock" if int(egg["id"]) == 28 else "vanilla")
+            env.setdefault("MC_VERSION", "")
+            env.setdefault("MC_LOADER", "")
+            env.setdefault("MOTD", f"{name} on Meridian")
+        startup = substitute(egg["startup"], env)
+        conn.execute(
+            """INSERT INTO servers
+            (id, short_id, name, description, egg_id, owner_id, node_id, memory, cpu, disk,
+             swap, io, allocation_ip, allocation_port, startup, image, environment, status,
+             created_at, installed, plan_id, plan_activated_at, plan_expires_at,
+             mc_status, mc_message)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 500, ?, ?, ?, ?, ?, 'offline', ?,
+                    1, ?, ?, ?, ?, ?)""",
+            (
+                sid,
+                short,
+                name,
+                f"{plan['name']} plan deployment",
+                int(egg["id"]),
+                order["user_id"],
+                node_id,
+                plan["memory"],
+                plan["cpu"],
+                plan["disk"],
+                int(plan.get("swap") or 0),
+                alloc_ip,
+                port,
+                startup,
+                egg["docker_image"],
+                json.dumps(env),
+                utcnow(),
+                int(plan["id"]),
+                utcnow(),
+                plan_expiry(),
+                "queued" if int(egg["id"]) in (27, 28) else "not-applicable",
+                "Queued for installation" if int(egg["id"]) in (27, 28) else "",
+            ),
+        )
+    install_egg_files(sid, int(egg["id"]), env)
+    with db() as conn:
+        row = conn.execute(
+            """SELECT s.*, e.name AS egg_name, n.name AS nest_name, u.username AS owner_name,
+                      e.nest_id
+               FROM servers s
+               JOIN eggs e ON e.id = s.egg_id
+               JOIN nests n ON n.id = e.nest_id
+               JOIN users u ON u.id = s.owner_id
+               WHERE s.id = ?""",
+            (sid,),
+        ).fetchone()
+    server_row = row_to_dict(row) or {}
+    log_activity(
+        actor_id,
+        sid,
+        "server:provisioned",
+        {"plan": plan["slug"], "order": order.get("code"), "node_id": node_id},
+    )
+    mc_job = None
+    if int(egg["id"]) in (27, 28):
+        config = _mc_config(
+            {
+                "software": "bedrock" if int(egg["id"]) == 28 else "vanilla",
+                "accept_eula": True,
+            },
+            "bedrock" if int(egg["id"]) == 28 else "vanilla",
+        )
+        config["accept_eula"] = True
+        mc_job = await _begin_mc_install(
+            {**server_row, "id": sid, "memory": plan["memory"], "allocation_port": port},
+            config,
+            actor_id,
+        )
+        with db() as conn:
+            conn.execute(
+                """UPDATE servers SET mc_software = ?, mc_version = ?, mc_loader_version = ?,
+                   mc_status = 'queued', mc_message = 'Queued for installation' WHERE id = ?""",
+                (config["software"], config["version"], config["loader_version"], sid),
+            )
+        server_row.update(
+            {
+                "mc_software": config["software"],
+                "mc_version": config["version"],
+                "mc_loader_version": config["loader_version"],
+                "mc_status": "queued",
+                "mc_message": "Queued for installation",
+            }
+        )
+    return server_row, mc_job
+
+
+def apply_plan_to_existing(
+    order: dict[str, Any], plan: dict[str, Any], actor_id: int | None
+) -> dict[str, Any]:
+    target_id = str(order.get("target_server_id") or "")
+    if not target_id:
+        raise HTTPException(400, "Choose an existing server for this plan")
+    with db() as conn:
+        server = row_to_dict(
+            conn.execute("SELECT * FROM servers WHERE id = ?", (target_id,)).fetchone()
+        )
+        if not server:
+            raise HTTPException(404, "The target server no longer exists")
+        if int(server["owner_id"]) != int(order["user_id"]):
+            raise HTTPException(400, "The target server does not belong to the buyer")
+        try:
+            environment = json.loads(server.get("environment") or "{}")
+        except json.JSONDecodeError:
+            environment = {}
+        environment["SERVER_MEMORY"] = str(plan["memory"])
+        conn.execute(
+            """UPDATE servers SET memory = ?, cpu = ?, disk = ?, swap = ?, io = ?,
+               environment = ?, plan_id = ?, plan_activated_at = ?, plan_expires_at = ?
+               WHERE id = ?""",
+            (
+                plan["memory"],
+                plan["cpu"],
+                plan["disk"],
+                int(plan.get("swap") or 0),
+                int(plan.get("io") or 500),
+                json.dumps(environment),
+                int(plan["id"]),
+                utcnow(),
+                plan_expiry(),
+                target_id,
+            ),
+        )
+        row = conn.execute(
+            """SELECT s.*, e.name AS egg_name, n.name AS nest_name, u.username AS owner_name,
+                      e.nest_id
+               FROM servers s
+               JOIN eggs e ON e.id = s.egg_id
+               JOIN nests n ON n.id = e.nest_id
+               JOIN users u ON u.id = s.owner_id
+               WHERE s.id = ?""",
+            (target_id,),
+        ).fetchone()
+    inst = manager.instances.get(target_id)
+    if inst:
+        updated = row_to_dict(row) or {}
+        inst.server.update(
+            {
+                "memory": plan["memory"],
+                "cpu": plan["cpu"],
+                "disk": plan["disk"],
+                "environment": environment,
+            }
+        )
+        if updated:
+            inst.server.update(updated)
+    log_activity(
+        actor_id,
+        target_id,
+        "server:plan-applied",
+        {"plan": plan["slug"], "order": order.get("code")},
+    )
+    return row_to_dict(row) or {}
+
+
+def order_provision_target(order: dict[str, Any]) -> bool:
+    return bool(str(order.get("target_server_id") or "").strip())
+
+
+async def fulfill_order(order: dict[str, Any], plan: dict[str, Any], actor_id: int | None) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    if order_provision_target(order):
+        return apply_plan_to_existing(order, plan, actor_id), None
+    return await provision_order_server(order, plan, actor_id)
+
+
+def rules_for_server(server: dict[str, Any]) -> list[dict[str, Any]]:
+    with db() as conn:
+        rows = rows_to_list(
+            conn.execute(
+                """SELECT * FROM rules
+                   WHERE enabled = 1 AND (
+                     scope = 'global'
+                     OR (scope = 'nest' AND nest_id = ?)
+                     OR (scope = 'egg' AND egg_id = ?)
+                     OR (scope = 'server' AND server_id = ?)
+                   )
+                   ORDER BY CASE scope
+                     WHEN 'global' THEN 0 WHEN 'nest' THEN 1 WHEN 'egg' THEN 2
+                     WHEN 'server' THEN 3 ELSE 4 END, sort_order, id""",
+                (server.get("nest_id"), server.get("egg_id"), server.get("id")),
+            ).fetchall()
+        )
+    labels = {"global": "All servers", "nest": "Server type", "egg": "This template", "server": "This server"}
+    for row in rows:
+        row["scope_label"] = labels.get(row.get("scope") or "global", "Rule")
+        row["enabled"] = bool(row.get("enabled"))
+    return rows
+
+
+def rules_context(server: dict[str, Any]) -> str:
+    rules = rules_for_server(server)
+    if not rules:
+        return ""
+    lines = ["Server rules and acceptable-use policy:"]
+    for rule in rules[:12]:
+        lines.append(f"- [{rule['severity']}] {rule['title']}: {str(rule['body'])[:400]}")
+    return "\n".join(lines)
+
+
+def security_settings(conn: Any) -> dict[str, Any]:
+    rows = conn.execute(
+        "SELECT key, value FROM settings WHERE key LIKE 'security_%'"
+    ).fetchall()
+    values = {row["key"]: row["value"] for row in rows}
+    try:
+        threshold = int(values.get("security_ban_threshold") or 4)
+    except (TypeError, ValueError):
+        threshold = 4
+    return {
+        "detection": values.get("security_detection", "true") != "false",
+        "auto_suspend": values.get("security_auto_suspend", "true") != "false",
+        "ban_threshold": max(2, min(10, threshold)),
+    }
+
+
+def security_strike_payload(row: Any) -> dict[str, Any]:
+    data = row_to_dict(row) if not isinstance(row, dict) else dict(row)
+    return {
+        "id": data.get("id"),
+        "user_id": data.get("user_id"),
+        "server_id": data.get("server_id"),
+        "source": data.get("source"),
+        "pattern": data.get("pattern"),
+        "label": data.get("label"),
+        "category": data.get("category"),
+        "severity": data.get("severity"),
+        "snippet": data.get("snippet"),
+        "action": data.get("action"),
+        "created_at": data.get("created_at"),
+        "username": data.get("username"),
+        "server_name": data.get("server_name"),
+    }
+
+
+def strike_total(user_id: int, conn: Any | None = None) -> int:
+    if conn is not None:
+        return int(
+            conn.execute(
+                "SELECT COUNT(*) AS c FROM security_strikes WHERE user_id = ?", (user_id,)
+            ).fetchone()["c"]
+        )
+    with db() as local:
+        return int(
+            local.execute(
+                "SELECT COUNT(*) AS c FROM security_strikes WHERE user_id = ?", (user_id,)
+            ).fetchone()["c"]
+        )
+
+
+async def suspend_all_for_user(user_id: int) -> None:
+    with db() as conn:
+        rows = rows_to_list(
+            conn.execute("SELECT * FROM servers WHERE owner_id = ?", (user_id,)).fetchall()
+        )
+        conn.execute(
+            "UPDATE servers SET suspended = 1, suspended_reason = ? WHERE owner_id = ?",
+            (
+                "Account security hold. Contact the panel owner for a review.",
+                user_id,
+            ),
+        )
+    for row in rows:
+        inst = manager.get(row)
+        try:
+            await inst.stop(kill=True)
+        except Exception:
+            pass
+    with db() as conn:
+        conn.execute(
+            "UPDATE servers SET suspended = 1, suspended_reason = ? WHERE owner_id = ?",
+            (
+                "Account security hold. Contact the panel owner for a review.",
+                user_id,
+            ),
+        )
+
+
+async def record_security_event(
+    user: dict[str, Any],
+    server: dict[str, Any],
+    source: str,
+    findings: list[dict[str, Any]],
+    subject: str = "",
+) -> dict[str, Any]:
+    finding = critical_finding(findings) or findings[0]
+    label = finding["label"]
+    with db() as conn:
+        settings = security_settings(conn)
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=15)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        recent = conn.execute(
+            """SELECT id FROM security_strikes
+               WHERE user_id = ? AND server_id = ? AND pattern = ? AND created_at >= ?
+               ORDER BY id DESC LIMIT 1""",
+            (user["id"], server.get("id"), finding["id"], cutoff),
+        ).fetchone()
+        created_strike = False
+        if not recent:
+            conn.execute(
+                """INSERT INTO security_strikes
+                   (user_id, server_id, source, pattern, label, category, severity,
+                    snippet, action, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    user["id"],
+                    server.get("id"),
+                    source[:40],
+                    finding["id"],
+                    label[:120],
+                    finding["category"][:60],
+                    finding["severity"],
+                    (finding.get("snippet") or subject)[:240],
+                    "blocked",
+                    utcnow(),
+                ),
+            )
+            created_strike = True
+        total = strike_total(int(user["id"]), conn)
+        threshold = settings["ban_threshold"]
+        auto_suspend = settings["auto_suspend"] and finding["severity"] == "critical"
+        if auto_suspend:
+            conn.execute(
+                "UPDATE servers SET suspended = 1, suspended_reason = ? WHERE id = ?",
+                (
+                    f"Security hold: {label}. Review the rules before requesting an unsuspend.",
+                    server.get("id"),
+                ),
+            )
+        should_ban = total >= threshold and user.get("role") != "admin"
+        if should_ban:
+            conn.execute(
+                "UPDATE users SET banned = 1, banned_at = ?, ban_reason = ? WHERE id = ?",
+                (
+                    utcnow(),
+                    f"Automatic security ban after {total} blocked dangerous-activity attempts. Latest: {label}.",
+                    user["id"],
+                ),
+            )
+        suspended_reason = ""
+        row = conn.execute(
+            "SELECT suspended_reason FROM servers WHERE id = ?", (server.get("id"),)
+        ).fetchone()
+        if row:
+            suspended_reason = row["suspended_reason"] or ""
+    if auto_suspend:
+        inst = manager.get(server)
+        try:
+            await inst.stop(kill=True)
+        except Exception:
+            pass
+    if should_ban:
+        await suspend_all_for_user(int(user["id"]))
+    log_activity(
+        user["id"],
+        server.get("id"),
+        "security:dangerous-activity",
+        {
+            "source": source,
+            "pattern": finding["id"],
+            "label": label,
+            "severity": finding["severity"],
+            "subject": subject[:180],
+            "strike": total,
+            "threshold": threshold,
+            "suspended": auto_suspend,
+            "banned": should_ban,
+        },
+    )
+    if should_ban:
+        log_activity(None, None, "security:account-ban", {"user_id": user["id"], "strikes": total})
+    if user.get("role") == "admin" and total >= threshold:
+        action_note = "Administrator accounts are protected from automatic bans; review this event in Security."
+    elif should_ban:
+        action_note = "The account has been banned and every owned server was suspended."
+    elif auto_suspend:
+        action_note = "The server has been suspended until the owner reviews the event."
+    else:
+        action_note = "The action was blocked and recorded."
+    return {
+        "finding": finding,
+        "findings": findings,
+        "strike": total,
+        "threshold": threshold,
+        "created": created_strike,
+        "suspended": bool(auto_suspend) or bool(suspended_reason.startswith("Security hold")),
+        "banned": bool(should_ban),
+        "reason": suspended_reason,
+        "action_note": action_note,
+        "message": (
+            f"Security policy blocked {label}. Strike {total} of {threshold}. {action_note}"
+        ),
+    }
+
+
+async def guard_dangerous_activity(
+    user: dict[str, Any],
+    server: dict[str, Any],
+    text: str,
+    source: str,
+    subject: str = "",
+) -> dict[str, Any] | None:
+    with db() as conn:
+        settings = security_settings(conn)
+    if not settings["detection"]:
+        return None
+    findings = scan_dangerous_activity(text)
+    if not findings:
+        return None
+    return await record_security_event(user, server, source, findings, subject)
+
+
+def security_http_error(payload: dict[str, Any]) -> HTTPException:
+    return HTTPException(
+        403 if payload.get("banned") else 400,
+        security_message(payload),
+        headers={"X-Security-Blocked": "1"},
+    )
+
+
+async def assert_ws_allowed(user_id: int, server_id: str) -> None:
+    with db() as conn:
+        user = conn.execute("SELECT banned FROM users WHERE id = ?", (user_id,)).fetchone()
+        server = conn.execute(
+            "SELECT suspended, suspended_reason FROM servers WHERE id = ?", (server_id,)
+        ).fetchone()
+    if user and user["banned"]:
+        raise HTTPException(403, "This account is suspended for repeated dangerous activity")
+    if server and server["suspended"]:
+        reason = str(server["suspended_reason"] or "").strip()
+        raise HTTPException(403, "This server is suspended." + (f" {reason}" if reason else ""))
+
+
+def security_message(payload: dict[str, Any]) -> str:
+    finding = payload.get("finding") or {}
+    return (
+        f"Security policy blocked {finding.get('label') or 'dangerous activity'}. "
+        f"Strike {payload.get('strike')} of {payload.get('threshold')}. "
+        f"{payload.get('action_note') or ''}"
+    ).strip()
 
 
 @app.on_event("startup")
@@ -2362,11 +3244,52 @@ async def execute_schedule(server: dict[str, Any], sch: dict[str, Any]) -> list[
             }
         ]
     results: list[dict[str, Any]] = []
+    owner: dict[str, Any] | None = None
     for task in tasks:
         offset = max(0, min(int(task.get("time_offset") or 0), 3600))
         if offset:
             await asyncio.sleep(offset)
         action = str(task.get("action") or "")
+        if action == "command" and task.get("payload"):
+            if owner is None:
+                with db() as conn:
+                    owner = row_to_dict(
+                        conn.execute(
+                            "SELECT * FROM users WHERE id = ?", (server.get("owner_id"),)
+                        ).fetchone()
+                    )
+            if owner:
+                blocked = await guard_dangerous_activity(
+                    owner,
+                    server,
+                    str(task.get("payload") or ""),
+                    "schedule",
+                    str(task.get("payload") or "")[:180],
+                )
+                if blocked:
+                    results.append(
+                        {
+                            "action": action,
+                            "status": "blocked",
+                            "payload": task.get("payload") or "",
+                            "error": security_message(blocked),
+                        }
+                    )
+                    log_activity(
+                        None,
+                        server["id"],
+                        "schedule:blocked",
+                        {
+                            "schedule": sch.get("name"),
+                            "action": action,
+                            "security": (blocked.get("finding") or {}).get("label"),
+                        },
+                    )
+                    if blocked.get("suspended") or blocked.get("banned"):
+                        break
+                    if not task.get("continue_on_failure", 1):
+                        break
+                    continue
         try:
             await execute_schedule_task(server, sch, task)
             results.append({"action": action, "status": "completed", "payload": task.get("payload") or ""})
@@ -2468,6 +3391,7 @@ def login(body: LoginBody, request: Request) -> dict[str, Any]:
         note_login_failure(rate_key)
         raise HTTPException(401, "Invalid username or password")
     clear_login_failures(rate_key)
+    ensure_account_active(user)
     if user.get("totp_enabled"):
         return two_factor_challenge_payload(user)
     return finalize_login(user)
@@ -2487,6 +3411,7 @@ def login_two_factor(body: TwoFactorLoginBody, request: Request) -> dict[str, An
     user = row_to_dict(row)
     if not user or not user.get("totp_enabled"):
         raise HTTPException(401, "Two-factor authentication is not active for this account")
+    ensure_account_active(user)
     code = (body.code or "").strip()
     valid, step = verify_totp(
         str(user.get("totp_secret") or ""), code, last_step=int(user.get("totp_last_step") or 0)
@@ -2880,6 +3805,11 @@ async def server_command(
     server = get_server(server_id, user)
     reject_suspended(server)
     require_server_permission(server, user, "control.console")
+    blocked = await guard_dangerous_activity(
+        user, server, body.command, "console", body.command
+    )
+    if blocked:
+        raise security_http_error(blocked)
     inst = manager.get(server)
     await inst.send(body.command)
     return {"status": "ok"}
@@ -2991,12 +3921,18 @@ def file_contents(
 
 
 @app.post("/api/servers/{server_id}/files/save")
-def file_save(
+async def file_save(
     server_id: str, body: FileSaveBody, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, str]:
     server = get_server(server_id, user)
     reject_suspended(server)
     require_server_permission(server, user, "file.update")
+    if is_text_candidate(body.file, body.contents.encode("utf-8", errors="replace")):
+        blocked = await guard_dangerous_activity(
+            user, server, body.contents, "file-save", body.file
+        )
+        if blocked:
+            raise security_http_error(blocked)
     path = safe_join(server_id, body.file)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body.contents, encoding="utf-8")
@@ -3228,6 +4164,12 @@ async def file_upload(
     name = Path(upload.filename or "upload.bin").name
     dest = dest_dir / name
     data = await upload.read()
+    if is_text_candidate(name, data):
+        blocked = await guard_dangerous_activity(
+            user, server, data.decode("utf-8", errors="replace"), "file-upload", name
+        )
+        if blocked:
+            raise security_http_error(blocked)
     dest.write_bytes(data)
     return {"status": "ok", "name": name}
 
@@ -4051,11 +4993,12 @@ def list_databases(server_id: str, user: dict[str, Any] = Depends(user_from_head
                 "SELECT id, name, engine, host, port FROM database_hosts ORDER BY name"
             ).fetchall()
         )
+    limits = plan_limits_for_server(server)
     return {
         "data": rows,
         "meta": {
             "hosts": hosts,
-            "limit": SERVER_DATABASE_LIMIT,
+            "limit": limits["databases"],
             "client": bool(mysql_client()),
         },
     }
@@ -4068,12 +5011,18 @@ def create_database(
     server = get_server(server_id, user)
     reject_suspended(server)
     require_server_permission(server, user, "database.create")
+    limit = plan_limits_for_server(server)["databases"]
     with db() as conn:
         count = conn.execute(
             "SELECT COUNT(*) AS c FROM databases WHERE server_id = ?", (server_id,)
         ).fetchone()["c"]
-        if int(count) >= SERVER_DATABASE_LIMIT:
-            raise HTTPException(400, f"This server has reached its limit of {SERVER_DATABASE_LIMIT} databases")
+        if int(count) >= limit:
+            if limit <= 0:
+                raise HTTPException(
+                    400,
+                    "This server's plan does not include databases. Change the plan to add one.",
+                )
+            raise HTTPException(400, f"This server has reached its limit of {limit} databases")
         host_row = None
         if body.engine != "sqlite":
             if body.host_id:
@@ -4228,6 +5177,19 @@ def create_backup(server_id: str, user: dict[str, Any] = Depends(user_from_heade
     server = get_server(server_id, user)
     reject_suspended(server)
     require_server_permission(server, user, "backup.create")
+    limit = plan_limits_for_server(server)["backups"]
+    with db() as conn:
+        count = int(
+            conn.execute(
+                "SELECT COUNT(*) AS c FROM backups WHERE server_id = ?", (server_id,)
+            ).fetchone()["c"]
+        )
+    if count >= limit:
+        if limit <= 0:
+            raise HTTPException(
+                400, "This server's plan does not include backups. Change the plan to add them."
+            )
+        raise HTTPException(400, f"This server has reached its limit of {limit} backups")
     data = create_backup_file(server)
     log_activity(user["id"], server_id, "backup:create", {"id": data.get("id")})
     return {"data": data}
@@ -4402,15 +5364,23 @@ def list_schedules(server_id: str, user: dict[str, Any] = Depends(user_from_head
 
 
 @app.post("/api/servers/{server_id}/schedules")
-def create_schedule(
+async def create_schedule(
     server_id: str, body: ScheduleBody, user: dict[str, Any] = Depends(user_from_header)
 ) -> dict[str, Any]:
     server = get_server(server_id, user)
+    reject_suspended(server)
     require_server_permission(server, user, "schedule.create")
     name = body.name.strip()
     if not name:
         raise HTTPException(400, "Schedule name is required")
     tasks = validate_schedule_tasks(body)
+    for task in tasks:
+        if task["action"] == "command":
+            blocked = await guard_dangerous_activity(
+                user, server, task["payload"], "schedule", task["payload"][:180]
+            )
+            if blocked:
+                raise security_http_error(blocked)
     expr = body.cron.strip() or "*/5 * * * *"
     if len(expr.split()) != 5:
         raise HTTPException(400, "Cron expressions must contain five fields")
@@ -4442,18 +5412,26 @@ def create_schedule(
 
 
 @app.put("/api/servers/{server_id}/schedules/{schedule_id}")
-def edit_schedule(
+async def edit_schedule(
     server_id: str,
     schedule_id: int,
     body: ScheduleBody,
     user: dict[str, Any] = Depends(user_from_header),
 ) -> dict[str, Any]:
     server = get_server(server_id, user)
+    reject_suspended(server)
     require_server_permission(server, user, "schedule.update")
     name = body.name.strip()
     if not name:
         raise HTTPException(400, "Schedule name is required")
     tasks = validate_schedule_tasks(body)
+    for task in tasks:
+        if task["action"] == "command":
+            blocked = await guard_dangerous_activity(
+                user, server, task["payload"], "schedule", task["payload"][:180]
+            )
+            if blocked:
+                raise security_http_error(blocked)
     expr = body.cron.strip() or "*/5 * * * *"
     if len(expr.split()) != 5:
         raise HTTPException(400, "Cron expressions must contain five fields")
@@ -4584,7 +5562,20 @@ def add_network_allocation(
     server = get_server(server_id, user)
     reject_suspended(server)
     require_server_permission(server, user, "allocation.create")
+    limit = plan_limits_for_server(server)["allocations"]
     with db() as conn:
+        count = int(
+            conn.execute(
+                "SELECT COUNT(*) AS c FROM allocations WHERE server_id = ?", (server_id,)
+            ).fetchone()["c"]
+        )
+        if count >= limit:
+            raise HTTPException(
+                400,
+                f"This server's plan includes {limit} allocation"
+                + ("" if limit == 1 else "s")
+                + ". Change the plan to add another address.",
+            )
         if body.allocation_id:
             row = conn.execute(
                 "SELECT * FROM allocations WHERE id = ? AND node_id = ? AND server_id IS NULL",
@@ -4771,6 +5762,7 @@ def ws_user(token: str | None) -> dict[str, Any]:
     user = row_to_dict(row)
     if not user:
         raise HTTPException(401, "Invalid token")
+    ensure_account_active(user)
     user.pop("password_hash", None)
     return user
 
@@ -4882,7 +5874,7 @@ async def ws_terminal(websocket: WebSocket, server_id: str, token: str = Query("
                     {
                         "event": "terminal output",
                         "data": (
-                            f"\r\n\x1b[33m[vitestl] Command timed out after "
+                            f"\r\n\x1b[33m[meridian] Command timed out after "
                             f"{TERMINAL_TIMEOUT} seconds.\x1b[0m\r\n"
                         ),
                     }
@@ -4909,7 +5901,7 @@ async def ws_terminal(websocket: WebSocket, server_id: str, token: str = Query("
                         {
                             "event": "terminal output",
                             "data": (
-                                "\r\n\x1b[33m[vitestl] Output limit reached. "
+                                "\r\n\x1b[33m[meridian] Output limit reached. "
                                 "The command was stopped.\x1b[0m\r\n"
                             ),
                         }
@@ -4927,7 +5919,7 @@ async def ws_terminal(websocket: WebSocket, server_id: str, token: str = Query("
             await async_send(
                 {
                     "event": "terminal output",
-                    "data": f"\r\n\x1b[31m[vitestl] Shell not found: {argv[0]}\x1b[0m\r\n",
+                    "data": f"\r\n\x1b[31m[meridian] Shell not found: {argv[0]}\x1b[0m\r\n",
                 }
             )
         except Exception as exc:
@@ -4935,7 +5927,7 @@ async def ws_terminal(websocket: WebSocket, server_id: str, token: str = Query("
             await async_send(
                 {
                     "event": "terminal output",
-                    "data": f"\r\n\x1b[31m[vitestl] {str(exc)[:300]}\x1b[0m\r\n",
+                    "data": f"\r\n\x1b[31m[meridian] {str(exc)[:300]}\x1b[0m\r\n",
                 }
             )
         finally:
@@ -4995,7 +5987,7 @@ async def ws_terminal(websocket: WebSocket, server_id: str, token: str = Query("
                     await async_send(
                         {
                             "event": "terminal output",
-                            "data": "[vitestl] This terminal belongs to the panel session. "
+                            "data": "[meridian] This terminal belongs to the panel session. "
                             "Use the power controls or close the tab.\r\n",
                         }
                     )
@@ -5050,6 +6042,28 @@ async def ws_terminal(websocket: WebSocket, server_id: str, token: str = Query("
                         }
                     )
                     continue
+                blocked = await guard_dangerous_activity(
+                    user, server, command, "terminal", command
+                )
+                if blocked:
+                    await async_send(
+                        {
+                            "event": "security warning",
+                            **blocked,
+                        }
+                    )
+                    await async_send(
+                        {
+                            "event": "terminal output",
+                            "data": (
+                                "\r\n\x1b[31m[meridian] "
+                                + security_message(blocked)
+                                + "\x1b[0m\r\n"
+                            ),
+                        }
+                    )
+                    await finish_command(command, False, 126, 0)
+                    continue
                 session["task"] = asyncio.create_task(
                     run_command(command, sudo_enabled())
                 )
@@ -5059,7 +6073,7 @@ async def ws_terminal(websocket: WebSocket, server_id: str, token: str = Query("
                     await async_send(
                         {
                             "event": "terminal output",
-                            "data": "\r\n\x1b[38;5;244m[vitestl] Cancelling command...\x1b[0m\r\n",
+                            "data": "\r\n\x1b[38;5;244m[meridian] Cancelling command...\x1b[0m\r\n",
                         }
                     )
                     await terminate_terminal_process(proc)
@@ -5111,6 +6125,12 @@ async def ws_console(websocket: WebSocket, server_id: str, token: str = Query(""
                 except HTTPException as exc:
                     await websocket.send_json({"event": "error", "message": exc.detail})
                     continue
+                blocked = await guard_dangerous_activity(
+                    user, server, message, "console", message
+                )
+                if blocked:
+                    await websocket.send_json({"event": "security warning", **blocked})
+                    continue
                 await inst.send(message)
                 continue
             event = payload.get("event")
@@ -5121,7 +6141,14 @@ async def ws_console(websocket: WebSocket, server_id: str, token: str = Query(""
                     await websocket.send_json({"event": "error", "message": exc.detail})
                     continue
                 args = payload.get("args") or [""]
-                await inst.send(str(args[0]))
+                command = str(args[0])
+                blocked = await guard_dangerous_activity(
+                    user, server, command, "console", command
+                )
+                if blocked:
+                    await websocket.send_json({"event": "security warning", **blocked})
+                    continue
+                await inst.send(command)
             elif event == "set state":
                 sig = str((payload.get("args") or ["start"])[0])
                 if sig not in ("start", "stop", "restart", "kill"):
@@ -5482,6 +6509,16 @@ def failed_system_units() -> list[dict[str, str]]:
 
 def system_security_checks(ssh: dict[str, Any], firewall: dict[str, Any]) -> list[dict[str, str]]:
     checks: list[dict[str, str]] = []
+    if platform.system() != "Linux":
+        detail = f"Linux-only check; not evaluated on {platform.system() or 'this platform'}"
+        return [
+            {"id": "ssh-password", "label": "SSH password authentication", "status": "unavailable", "detail": detail},
+            {"id": "ssh-root", "label": "SSH root login", "status": "unavailable", "detail": detail},
+            {"id": "firewall", "label": "Host firewall", "status": "unavailable", "detail": detail},
+            {"id": "apparmor", "label": "AppArmor", "status": "unavailable", "detail": detail},
+            {"id": "unattended-upgrades", "label": "Automatic security updates", "status": "unavailable", "detail": detail},
+            {"id": "reboot", "label": "Reboot required", "status": "unavailable", "detail": detail},
+        ]
     password_auth = str(ssh.get("password_authentication") or "not set").lower()
     if password_auth in ("no", "false"):
         checks.append({"id": "ssh-password", "label": "SSH password authentication", "status": "ok", "detail": "Disabled"})
@@ -5544,7 +6581,13 @@ def system_security_checks(ssh: dict[str, Any], firewall: dict[str, Any]) -> lis
 
 
 def _collect_system_health() -> dict[str, Any]:
-    load = list(os.getloadavg()) if hasattr(os, "getloadavg") else [0.0, 0.0, 0.0]
+    load_available = hasattr(os, "getloadavg")
+    load: list[float] | None = None
+    if load_available:
+        try:
+            load = [round(float(value), 2) for value in os.getloadavg()]
+        except (AttributeError, OSError):
+            load_available = False
     cpu_count = psutil.cpu_count() or 1
     try:
         cpu_percent = psutil.cpu_percent(interval=0.2)
@@ -5647,7 +6690,8 @@ def _collect_system_health() -> dict[str, Any]:
             "cores": cpu_count,
             "physical": psutil.cpu_count(logical=False) or cpu_count,
             "percent": cpu_percent,
-            "load": [round(value, 2) for value in load],
+            "load": load,
+            "load_available": load_available,
             "frequency_mhz": round(frequency.current, 1) if frequency else 0,
             "per_core": psutil.cpu_percent(percpu=True, interval=0.1),
         },
@@ -6302,7 +7346,7 @@ def ai_system_prompt(server: dict[str, Any], body: AiChatBody) -> str:
     environment = environment or {}
     allocation = f"{server.get('allocation_ip') or '0.0.0.0'}:{server.get('allocation_port') or '-'}"
     details = [
-        "You are the VITESTERTL Operations Copilot, embedded in a game-server control panel.",
+        "You are the Meridian Operations Copilot, embedded in a game-server control panel.",
         "You help a server owner or administrator operate one specific server. You are not a generic chatbot.",
         "",
         "Server facts:",
@@ -6329,6 +7373,19 @@ def ai_system_prompt(server: dict[str, Any], body: AiChatBody) -> str:
     startup = str(server.get("startup") or "").strip()
     if startup:
         details.append(f"- Startup command: {startup[:400]}")
+    if server.get("plan_id"):
+        with db() as conn:
+            plan = plan_public(
+                conn.execute("SELECT * FROM plans WHERE id = ?", (server["plan_id"],)).fetchone()
+            )
+        if plan:
+            details.append(
+                f"- Plan: {plan['name']} ({plan['memory']} MiB RAM, {plan['cpu']}% CPU, "
+                f"{plan['disk']} MiB disk)"
+            )
+    policy = rules_context(server)
+    if policy:
+        details.extend(["", policy])
     details.extend(
         [
             f"- Terminal directory: {body.cwd or '/'}",
@@ -6342,6 +7399,11 @@ def ai_system_prompt(server: dict[str, Any], body: AiChatBody) -> str:
             "- Never claim you executed something. You cannot run commands; the operator does.",
             "- Never invent server facts that are not in this prompt or the attached transcript.",
             "- Never suggest exposing secrets, piping remote scripts to a shell, or disabling the firewall.",
+            "- Never suggest DDoS tooling, packet floods, port scans, stress tests, reverse shells, "
+            "credential theft, or destructive host commands. The panel blocks these actions, suspends "
+            "the server on critical findings and bans accounts after repeated attempts.",
+            "- If the operator asks for network abuse or host compromise, refuse in one sentence and "
+            "suggest a lawful diagnostic instead.",
             "- If a request is ambiguous or destructive, ask one targeted question first.",
             "- When the transcript contains an error, identify the failing line and the likely cause.",
             "- Keep answers focused; use short sections only when they improve scanability.",
@@ -6610,7 +7672,10 @@ def admin_activity(
     return {"data": decode_activity(rows_to_list(rows)), "total": total, "limit": limit, "offset": offset}
 
 
-USER_PUBLIC_COLS = "id, username, email, role, first_name, last_name, created_at, last_login"
+USER_PUBLIC_COLS = (
+    "id, username, email, role, first_name, last_name, created_at, last_login, "
+    "banned, banned_at, ban_reason"
+)
 
 
 @app.get("/api/admin/users")
@@ -7517,6 +8582,1172 @@ def meta() -> dict[str, Any]:
         "support_email": settings.get("support_email", ""),
         "registration": settings.get("registration", "false") == "true",
         "theme": settings.get("theme", "dark"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Customer billing, orders, redeem codes and server policy surfaces
+# ---------------------------------------------------------------------------
+
+
+def plan_slug(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", (value or "").lower()).strip("-")
+    return (slug or f"plan-{secrets.token_hex(2)}")[:48]
+
+
+def order_user(conn: Any, order_id: int, user_id: int) -> dict[str, Any]:
+    row = conn.execute(
+        ORDER_SELECT + " WHERE o.id = ? AND o.user_id = ?", (order_id, user_id)
+    ).fetchone()
+    order = order_payload(row)
+    if not order:
+        raise HTTPException(404, "Order not found")
+    return order
+
+
+def assert_new_server_capacity(
+    conn: Any, user: dict[str, Any], plan: dict[str, Any]
+) -> None:
+    owned = int(
+        conn.execute(
+            "SELECT COUNT(*) AS c FROM servers WHERE owner_id = ?", (user["id"],)
+        ).fetchone()["c"]
+    )
+    if owned >= int(plan["server_slots"]):
+        raise HTTPException(
+            400,
+            f"{plan['name']} includes {plural_slots(plan['server_slots'])}. "
+            "Choose a larger plan or apply this plan to an existing server.",
+        )
+
+
+def plural_slots(value: int) -> str:
+    return f"{value} deployment slot" + ("" if int(value) == 1 else "s")
+
+
+def validate_target_server(
+    conn: Any, user: dict[str, Any], target_server_id: str | None
+) -> dict[str, Any] | None:
+    target_id = str(target_server_id or "").strip()
+    if not target_id:
+        return None
+    server = row_to_dict(
+        conn.execute("SELECT * FROM servers WHERE id = ?", (target_id,)).fetchone()
+    )
+    if not server:
+        raise HTTPException(404, "The selected server no longer exists")
+    if int(server["owner_id"]) != int(user["id"]):
+        raise HTTPException(403, "You can only apply a plan to your own server")
+    if server.get("suspended"):
+        raise HTTPException(
+            400,
+            "The selected server is suspended. Request an unsuspend before changing its plan.",
+        )
+    return server
+
+
+@app.get("/api/billing/catalog")
+def billing_catalog(user: dict[str, Any] = Depends(user_from_header)) -> dict[str, Any]:
+    with db() as conn:
+        plans = rows_to_list(
+            conn.execute(
+                "SELECT * FROM plans WHERE active = 1 ORDER BY sort_order, price_cents, id"
+            ).fetchall()
+        )
+        methods = rows_to_list(
+            conn.execute(
+                """SELECT * FROM payment_methods WHERE enabled = 1
+                   ORDER BY sort_order, id"""
+            ).fetchall()
+        )
+        pending = int(
+            conn.execute(
+                "SELECT COUNT(*) AS c FROM orders WHERE user_id = ? AND status = 'pending'",
+                (user["id"],),
+            ).fetchone()["c"]
+        )
+        owned = int(
+            conn.execute(
+                "SELECT COUNT(*) AS c FROM servers WHERE owner_id = ?", (user["id"],)
+            ).fetchone()["c"]
+        )
+        current = rows_to_list(
+            conn.execute(
+                """SELECT s.id, s.name, s.plan_id, s.plan_expires_at, p.name AS plan_name,
+                          p.slug AS plan_slug, p.accent AS plan_accent
+                   FROM servers s JOIN plans p ON p.id = s.plan_id
+                   WHERE s.owner_id = ? ORDER BY s.name COLLATE NOCASE""",
+                (user["id"],),
+            ).fetchall()
+        )
+    now = datetime.now(timezone.utc)
+    for item in current:
+        expires = _parse_utc(item.get("plan_expires_at"))
+        item["plan_state"] = (
+            "expired" if expires is not None and expires <= now else "active"
+        )
+    methods_out = [
+        method
+        for method in (payment_method_public(row) for row in methods)
+        if method and method.get("configured")
+    ]
+    return {
+        "plans": [plan for plan in (plan_public(row) for row in plans) if plan],
+        "payment_methods": methods_out,
+        "summary": {
+            "pending_orders": pending,
+            "servers_owned": owned,
+            "current_plans": current,
+            "payment_ready": len(methods_out),
+        },
+    }
+
+
+@app.get("/api/billing/workloads")
+def billing_workloads(_: dict[str, Any] = Depends(user_from_header)) -> dict[str, Any]:
+    with db() as conn:
+        rows = rows_to_list(
+            conn.execute(
+                """SELECT e.id, e.name, e.description, e.runtime, e.nest_id,
+                          n.name AS nest_name
+                   FROM eggs e JOIN nests n ON n.id = e.nest_id
+                   WHERE e.id IN (SELECT id FROM eggs)
+                   ORDER BY n.name COLLATE NOCASE, e.name COLLATE NOCASE"""
+            ).fetchall()
+        )
+    return {"data": rows}
+
+
+@app.get("/api/billing/orders")
+def billing_orders(user: dict[str, Any] = Depends(user_from_header)) -> dict[str, Any]:
+    with db() as conn:
+        rows = conn.execute(
+            ORDER_SELECT + " WHERE o.user_id = ? ORDER BY o.id DESC LIMIT 60",
+            (user["id"],),
+        ).fetchall()
+    return {"data": [order for order in (order_payload(row) for row in rows) if order]}
+
+
+@app.get("/api/billing/orders/{order_id}")
+def billing_order(
+    order_id: int, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, Any]:
+    with db() as conn:
+        order = order_user(conn, order_id, int(user["id"]))
+    return {"data": order}
+
+
+@app.post("/api/billing/orders")
+def create_order(
+    body: OrderBody, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, Any]:
+    if user.get("banned"):
+        raise HTTPException(403, "This account is suspended for repeated dangerous activity")
+    if not body.terms_accepted:
+        raise HTTPException(400, "Accept the acceptable-use policy before placing an order")
+    with db() as conn:
+        plan = get_plan(conn, int(body.plan_id))
+        method = payment_method_public(
+            conn.execute(
+                "SELECT * FROM payment_methods WHERE id = ?", (int(body.payment_method_id),)
+            ).fetchone()
+        )
+        if not method or not method.get("enabled"):
+            raise HTTPException(400, "Choose an available payment method")
+        if not method.get("configured"):
+            raise HTTPException(
+                400,
+                "This payment method is not configured yet. Choose another method or contact the owner.",
+            )
+        target = validate_target_server(conn, user, body.target_server_id)
+        if target is None:
+            assert_new_server_capacity(conn, user, plan)
+            order_egg(body.egg_id)
+        server_name = (body.server_name or "").strip()[:80]
+        if target is None and not server_name:
+            server_name = f"{plan['name']} deployment"
+        reference = (body.reference or "").strip()[:120]
+        notes = (body.notes or "").strip()[:600]
+        proof = validate_proof_data(body.proof_data)
+        code = new_order_code(conn)
+        cur = conn.execute(
+            """INSERT INTO orders
+            (code, user_id, plan_id, payment_method_id, target_server_id, server_name,
+             egg_id, node_id, amount_cents, currency, status, reference, notes, proof_data,
+             terms_accepted, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 'pending', ?, ?, ?, 1, ?, ?)""",
+            (
+                code,
+                user["id"],
+                plan["id"],
+                method["id"],
+                target["id"] if target else None,
+                server_name,
+                int(body.egg_id) if target is None and body.egg_id else None,
+                int(plan["price_cents"]),
+                plan["currency"],
+                reference,
+                notes,
+                proof,
+                utcnow(),
+                utcnow(),
+            ),
+        )
+        order_id = int(cur.lastrowid)
+        order = get_order(conn, order_id)
+    log_activity(
+        user["id"],
+        target["id"] if target else None,
+        "order:create",
+        {"order": order["code"], "plan": plan["slug"], "amount_cents": order["amount_cents"]},
+    )
+    return {"data": order}
+
+
+@app.post("/api/billing/orders/{order_id}/proof")
+def update_order_proof(
+    order_id: int, body: OrderProofBody, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, Any]:
+    with db() as conn:
+        order = order_user(conn, order_id, int(user["id"]))
+        if order["status"] != "pending":
+            raise HTTPException(400, "Only pending orders can be updated")
+        proof = validate_proof_data(body.proof_data) if body.proof_data else order["proof_data"]
+        conn.execute(
+            """UPDATE orders SET reference = ?, notes = ?, proof_data = ?, updated_at = ?
+               WHERE id = ? AND user_id = ?""",
+            (
+                (body.reference or order["reference"] or "").strip()[:120],
+                (body.notes or order["notes"] or "").strip()[:600],
+                proof,
+                utcnow(),
+                order_id,
+                user["id"],
+            ),
+        )
+        order = order_user(conn, order_id, int(user["id"]))
+    log_activity(
+        user["id"], order.get("target_server_id"), "order:proof", {"order": order["code"]}
+    )
+    return {"data": order}
+
+
+@app.post("/api/billing/orders/{order_id}/cancel")
+def cancel_order(
+    order_id: int, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, Any]:
+    with db() as conn:
+        order = order_user(conn, order_id, int(user["id"]))
+        if order["status"] != "pending":
+            raise HTTPException(400, "Only pending orders can be cancelled")
+        conn.execute(
+            "UPDATE orders SET status = 'cancelled', updated_at = ? WHERE id = ?",
+            (utcnow(), order_id),
+        )
+        order = order_user(conn, order_id, int(user["id"]))
+    log_activity(
+        user["id"], order.get("target_server_id"), "order:cancel", {"order": order["code"]}
+    )
+    return {"data": order}
+
+
+@app.get("/api/servers/{server_id}/rules")
+def server_rules(
+    server_id: str, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    return {"data": rules_for_server(server)}
+
+
+@app.get("/api/servers/{server_id}/security")
+def server_security(
+    server_id: str, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, Any]:
+    server = get_server(server_id, user)
+    with db() as conn:
+        settings = security_settings(conn)
+        total = strike_total(int(user["id"]), conn)
+        rows = rows_to_list(
+            conn.execute(
+                """SELECT * FROM security_strikes WHERE server_id = ?
+                   ORDER BY id DESC LIMIT 20""",
+                (server_id,),
+            ).fetchall()
+        )
+        latest = conn.execute(
+            "SELECT COUNT(*) AS c FROM security_strikes WHERE server_id = ?", (server_id,)
+        ).fetchone()["c"]
+    return {
+        "settings": settings,
+        "strikes": total,
+        "server_strikes": int(latest),
+        "recent": [security_strike_payload(row) for row in rows],
+        "suspended": bool(server.get("suspended")),
+        "reason": server.get("suspended_reason") or "",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Owner administration: commerce
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/admin/plans")
+def admin_plans(_: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM plans ORDER BY sort_order, id").fetchall()
+    return {"data": [plan for plan in (plan_public(row) for row in rows) if plan]}
+
+
+def write_plan(conn: Any, plan_id: int | None, body: PlanBody) -> dict[str, Any]:
+    name = body.name.strip()[:80]
+    if not name:
+        raise HTTPException(400, "Plan name is required")
+    slug = plan_slug(body.slug or name)
+    existing = (
+        conn.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+        if plan_id is not None
+        else None
+    )
+    if plan_id is not None and not existing:
+        raise HTTPException(404, "Plan not found")
+    clash = conn.execute(
+        "SELECT id FROM plans WHERE slug = ? AND id IS NOT ?", (slug, plan_id)
+    ).fetchone()
+    if clash:
+        raise HTTPException(400, "Another plan already uses this slug")
+    if body.price_cents < 0 or body.price_cents > 10_000_000:
+        raise HTTPException(400, "Price is out of range")
+    accent = body.accent.strip() if body.accent else "#43b8f5"
+    if not re.match(r"^#[0-9a-fA-F]{6}$", accent):
+        raise HTTPException(400, "Accent colours must use six-digit hex notation")
+    features = [str(item).strip()[:160] for item in body.features if str(item).strip()][:16]
+    payload = (
+        slug,
+        name,
+        body.tagline.strip()[:160],
+        body.description.strip()[:2000],
+        max(0, int(body.price_cents)),
+        body.currency.strip()[:8] or "MYR",
+        body.billing_period.strip()[:20] or "month",
+        max(32, int(body.memory)),
+        max(10, int(body.cpu)),
+        max(128, int(body.disk)),
+        max(0, int(body.swap)),
+        max(10, min(2000, int(body.io))),
+        max(1, min(100, int(body.server_slots))),
+        max(0, min(100, int(body.database_limit))),
+        max(0, min(100, int(body.backup_limit))),
+        max(1, min(100, int(body.allocation_limit))),
+        json.dumps(features),
+        json.dumps(body.artifact if isinstance(body.artifact, dict) else {}),
+        accent,
+        body.badge.strip()[:40],
+        int(body.sort_order),
+        1 if body.featured else 0,
+        1 if body.active else 0,
+        utcnow(),
+    )
+    if existing:
+        conn.execute(
+            """UPDATE plans SET slug = ?, name = ?, tagline = ?, description = ?, price_cents = ?,
+               currency = ?, billing_period = ?, memory = ?, cpu = ?, disk = ?, swap = ?,
+               io = ?, server_slots = ?, database_limit = ?, backup_limit = ?,
+               allocation_limit = ?, features = ?, artifact = ?, accent = ?, badge = ?,
+               sort_order = ?, featured = ?, active = ?, updated_at = ? WHERE id = ?""",
+            (*payload, int(plan_id)),
+        )
+        out_id = int(plan_id)
+    else:
+        cur = conn.execute(
+            """INSERT INTO plans
+            (slug, name, tagline, description, price_cents, currency, billing_period,
+             memory, cpu, disk, swap, io, server_slots, database_limit, backup_limit,
+             allocation_limit, features, artifact, accent, badge, sort_order,
+             featured, active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?)""",
+            (*payload, utcnow()),
+        )
+        out_id = int(cur.lastrowid)
+    return plan_public(conn.execute("SELECT * FROM plans WHERE id = ?", (out_id,)).fetchone()) or {}
+
+
+@app.post("/api/admin/plans")
+def admin_create_plan(
+    body: PlanBody, admin: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    with db() as conn:
+        plan = write_plan(conn, None, body)
+    log_activity(admin["id"], None, "plan:create", {"plan": plan.get("slug")})
+    return {"data": plan}
+
+
+@app.put("/api/admin/plans/{plan_id}")
+def admin_update_plan(
+    plan_id: int, body: PlanBody, admin: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    with db() as conn:
+        plan = write_plan(conn, plan_id, body)
+    log_activity(admin["id"], None, "plan:update", {"plan": plan.get("slug")})
+    return {"data": plan}
+
+
+@app.delete("/api/admin/plans/{plan_id}")
+def admin_disable_plan(
+    plan_id: int, admin: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Plan not found")
+        conn.execute(
+            "UPDATE plans SET active = 0, updated_at = ? WHERE id = ?", (utcnow(), plan_id)
+        )
+        plan = plan_public(conn.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone())
+    log_activity(admin["id"], None, "plan:disable", {"plan": (plan or {}).get("slug")})
+    return {"data": plan}
+
+
+def write_payment_method(
+    conn: Any, method_id: int | None, body: PaymentMethodBody
+) -> dict[str, Any]:
+    name = body.name.strip()[:80]
+    if not name:
+        raise HTTPException(400, "Payment method name is required")
+    kind = body.kind.strip() if body.kind else "manual"
+    if kind not in PAYMENT_METHOD_KINDS:
+        raise HTTPException(400, "Unknown payment method type")
+    if method_id is not None:
+        existing = conn.execute(
+            "SELECT * FROM payment_methods WHERE id = ?", (method_id,)
+        ).fetchone()
+        if not existing:
+            raise HTTPException(404, "Payment method not found")
+    payload = (
+        name,
+        kind,
+        body.account_name.strip()[:120],
+        body.account_id.strip()[:120],
+        validate_qr_image(body.qr_image),
+        body.instructions.strip()[:1000],
+        1 if body.enabled else 0,
+        int(body.sort_order),
+        utcnow(),
+    )
+    if method_id is None:
+        cur = conn.execute(
+            """INSERT INTO payment_methods
+            (name, kind, account_name, account_id, qr_image, instructions, enabled,
+             sort_order, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (*payload, utcnow()),
+        )
+        out_id = int(cur.lastrowid)
+    else:
+        conn.execute(
+            """UPDATE payment_methods SET name = ?, kind = ?, account_name = ?,
+               account_id = ?, qr_image = ?, instructions = ?, enabled = ?, sort_order = ?,
+               updated_at = ? WHERE id = ?""",
+            (*payload, int(method_id)),
+        )
+        out_id = int(method_id)
+    row = conn.execute("SELECT * FROM payment_methods WHERE id = ?", (out_id,)).fetchone()
+    return payment_method_public(row) or {}
+
+
+@app.get("/api/admin/payment-methods")
+def admin_payment_methods(_: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM payment_methods ORDER BY sort_order, id"
+        ).fetchall()
+    return {"data": [method for method in (payment_method_public(row) for row in rows) if method]}
+
+
+@app.post("/api/admin/payment-methods")
+def admin_create_payment_method(
+    body: PaymentMethodBody, admin: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    with db() as conn:
+        method = write_payment_method(conn, None, body)
+    log_activity(admin["id"], None, "payment:create", {"method": method.get("name")})
+    return {"data": method}
+
+
+@app.put("/api/admin/payment-methods/{method_id}")
+def admin_update_payment_method(
+    method_id: int, body: PaymentMethodBody, admin: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    with db() as conn:
+        method = write_payment_method(conn, method_id, body)
+    log_activity(admin["id"], None, "payment:update", {"method": method.get("name")})
+    return {"data": method}
+
+
+@app.delete("/api/admin/payment-methods/{method_id}")
+def admin_disable_payment_method(
+    method_id: int, admin: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM payment_methods WHERE id = ?", (method_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Payment method not found")
+        conn.execute(
+            "UPDATE payment_methods SET enabled = 0, updated_at = ? WHERE id = ?",
+            (utcnow(), method_id),
+        )
+        method = payment_method_public(
+            conn.execute("SELECT * FROM payment_methods WHERE id = ?", (method_id,)).fetchone()
+        )
+    log_activity(admin["id"], None, "payment:disable", {"method": (method or {}).get("name")})
+    return {"data": method}
+
+
+@app.get("/api/admin/orders")
+def admin_orders(
+    status: str = Query(""), _: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    where = ""
+    args: list[Any] = []
+    if status:
+        if status not in ORDER_STATUSES:
+            raise HTTPException(400, "Unknown order status")
+        where = " WHERE o.status = ?"
+        args.append(status)
+    with db() as conn:
+        rows = conn.execute(
+            ORDER_SELECT + where + " ORDER BY o.id DESC LIMIT 200", args
+        ).fetchall()
+        counts = {
+            row["status"]: int(row["c"])
+            for row in conn.execute(
+                "SELECT status, COUNT(*) AS c FROM orders GROUP BY status"
+            ).fetchall()
+        }
+    return {
+        "data": [order for order in (order_payload(row) for row in rows) if order],
+        "counts": counts,
+    }
+
+
+@app.get("/api/admin/orders/{order_id}")
+def admin_order(
+    order_id: int, _: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    with db() as conn:
+        return {"data": get_order(conn, order_id)}
+
+
+@app.post("/api/admin/orders/{order_id}/approve")
+async def admin_approve_order(
+    order_id: int,
+    body: OrderRejectBody | None = None,
+    admin: dict[str, Any] = Depends(admin_user),
+) -> dict[str, Any]:
+    if order_id in REVIEWING_ORDERS:
+        raise HTTPException(409, "This order is already being reviewed")
+    REVIEWING_ORDERS.add(order_id)
+    try:
+        with db() as conn:
+            order = get_order(conn, order_id)
+            if order["status"] != "pending":
+                raise HTTPException(400, "Only pending orders can be approved")
+            buyer = row_to_dict(
+                conn.execute("SELECT * FROM users WHERE id = ?", (order["user_id"],)).fetchone()
+            )
+            if not buyer:
+                raise HTTPException(400, "The buyer account no longer exists")
+            if buyer.get("banned"):
+                raise HTTPException(400, "Unban the buyer before approving this order")
+            plan = get_plan(conn, int(order["plan_id"]), active_only=False)
+            conn.execute(
+                """UPDATE orders SET admin_note = ?, reviewed_by = ?, reviewed_at = ?,
+                   updated_at = ? WHERE id = ?""",
+                (
+                    (body.reason if body else "").strip()[:600],
+                    admin["id"],
+                    utcnow(),
+                    utcnow(),
+                    order_id,
+                ),
+            )
+        try:
+            server, mc_job = await fulfill_order(order, plan, int(admin["id"]))
+        except HTTPException as exc:
+            with db() as conn:
+                conn.execute(
+                    """UPDATE orders SET admin_note = ?, updated_at = ? WHERE id = ?""",
+                    (f"Approval failed: {exc.detail}"[:600], utcnow(), order_id),
+                )
+            raise
+        except Exception as exc:
+            with db() as conn:
+                conn.execute(
+                    """UPDATE orders SET admin_note = ?, updated_at = ? WHERE id = ?""",
+                    (f"Approval failed: {str(exc)[:400]}", utcnow(), order_id),
+                )
+            raise HTTPException(502, f"The server could not be provisioned: {str(exc)[:300]}") from exc
+        with db() as conn:
+            conn.execute(
+                """UPDATE orders SET status = 'approved', server_id = ?, admin_note = ?,
+                   reviewed_by = ?, reviewed_at = ?, updated_at = ? WHERE id = ?""",
+                (
+                    server.get("id"),
+                    (body.reason if body else "").strip()[:600],
+                    admin["id"],
+                    utcnow(),
+                    utcnow(),
+                    order_id,
+                ),
+            )
+            order = get_order(conn, order_id)
+        log_activity(
+            admin["id"],
+            server.get("id"),
+            "order:approve",
+            {"order": order["code"], "buyer": order["user_id"], "plan": plan["slug"]},
+        )
+        return {
+            "data": order,
+            "server": decorate_server(server) if server else None,
+            "minecraft_job": mc_job,
+        }
+    finally:
+        REVIEWING_ORDERS.discard(order_id)
+
+
+@app.post("/api/admin/orders/{order_id}/reject")
+def admin_reject_order(
+    order_id: int, body: OrderRejectBody, admin: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    with db() as conn:
+        order = get_order(conn, order_id)
+        if order["status"] != "pending":
+            raise HTTPException(400, "Only pending orders can be rejected")
+        reason = (body.reason or "").strip()[:600]
+        if not reason:
+            raise HTTPException(400, "Add a short reason so the buyer understands the decision")
+        conn.execute(
+            """UPDATE orders SET status = 'rejected', admin_note = ?, reviewed_by = ?,
+               reviewed_at = ?, updated_at = ? WHERE id = ?""",
+            (reason, admin["id"], utcnow(), utcnow(), order_id),
+        )
+        order = get_order(conn, order_id)
+    log_activity(
+        admin["id"], order.get("target_server_id"), "order:reject", {"order": order["code"]}
+    )
+    return {"data": order}
+
+
+@app.get("/api/admin/redeem-codes")
+def admin_redeem_codes(_: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT r.*, p.name AS plan_name, p.accent AS plan_accent,
+                      p.price_cents AS plan_price
+               FROM redeem_codes r LEFT JOIN plans p ON p.id = r.plan_id
+               ORDER BY r.id DESC"""
+        ).fetchall()
+    data = rows_to_list(rows)
+    for row in data:
+        row["active"] = bool(row.get("active"))
+        row["expired"] = bool(
+            row.get("expires_at") and (_parse_utc(row["expires_at"]) or datetime.now(timezone.utc)) <= datetime.now(timezone.utc)
+        )
+    return {"data": data}
+
+
+@app.post("/api/admin/redeem-codes")
+def admin_create_redeem_code(
+    body: RedeemCodeBody, admin: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    with db() as conn:
+        plan = get_plan(conn, int(body.plan_id), active_only=False)
+        code = normalize_redeem_code(body.code)
+        if not code:
+            code = normalize_redeem_code(
+                f"MDN-GIFT-{secrets.token_hex(2)}-{secrets.token_hex(2)}"
+            )
+        if conn.execute("SELECT id FROM redeem_codes WHERE code = ?", (code,)).fetchone():
+            raise HTTPException(400, "That redeem code already exists")
+        max_uses = max(1, min(1000, int(body.max_uses)))
+        expires = body.expires_at.strip() if body.expires_at else None
+        if expires and _parse_utc(expires) is None:
+            raise HTTPException(400, "Expiry must use ISO-8601, for example 2026-12-31T23:59:59Z")
+        cur = conn.execute(
+            """INSERT INTO redeem_codes
+            (code, plan_id, max_uses, uses, expires_at, active, note, created_by, created_at)
+            VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)""",
+            (
+                code,
+                plan["id"],
+                max_uses,
+                expires,
+                1 if body.active else 0,
+                body.note.strip()[:300],
+                admin["id"],
+                utcnow(),
+            ),
+        )
+        row = conn.execute(
+            """SELECT r.*, p.name AS plan_name, p.accent AS plan_accent,
+                      p.price_cents AS plan_price
+               FROM redeem_codes r LEFT JOIN plans p ON p.id = r.plan_id WHERE r.id = ?""",
+            (int(cur.lastrowid),),
+        ).fetchone()
+        data = row_to_dict(row) or {}
+        data["active"] = bool(data.get("active"))
+    log_activity(admin["id"], None, "redeem:create", {"code": code, "plan": plan["slug"]})
+    return {"data": data}
+
+
+@app.put("/api/admin/redeem-codes/{code_id}")
+def admin_update_redeem_code(
+    code_id: int, body: RedeemCodeBody, admin: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM redeem_codes WHERE id = ?", (code_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Redeem code not found")
+        plan = get_plan(conn, int(body.plan_id), active_only=False)
+        code = normalize_redeem_code(body.code or row["code"])
+        clash = conn.execute(
+            "SELECT id FROM redeem_codes WHERE code = ? AND id != ?", (code, code_id)
+        ).fetchone()
+        if clash:
+            raise HTTPException(400, "That redeem code already exists")
+        expires = body.expires_at.strip() if body.expires_at else None
+        if expires and _parse_utc(expires) is None:
+            raise HTTPException(400, "Expiry must use ISO-8601")
+        conn.execute(
+            """UPDATE redeem_codes SET code = ?, plan_id = ?, max_uses = ?, expires_at = ?,
+               active = ?, note = ? WHERE id = ?""",
+            (
+                code,
+                plan["id"],
+                max(1, min(1000, int(body.max_uses))),
+                expires,
+                1 if body.active else 0,
+                body.note.strip()[:300],
+                code_id,
+            ),
+        )
+        data = row_to_dict(
+            conn.execute(
+                """SELECT r.*, p.name AS plan_name, p.accent AS plan_accent,
+                          p.price_cents AS plan_price
+                   FROM redeem_codes r LEFT JOIN plans p ON p.id = r.plan_id WHERE r.id = ?""",
+                (code_id,),
+            ).fetchone()
+        ) or {}
+        data["active"] = bool(data.get("active"))
+    log_activity(admin["id"], None, "redeem:update", {"code": code})
+    return {"data": data}
+
+
+@app.delete("/api/admin/redeem-codes/{code_id}")
+def admin_delete_redeem_code(
+    code_id: int, admin: dict[str, Any] = Depends(admin_user)
+) -> dict[str, str]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM redeem_codes WHERE id = ?", (code_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Redeem code not found")
+        conn.execute("DELETE FROM redeem_codes WHERE id = ?", (code_id,))
+    log_activity(admin["id"], None, "redeem:delete", {"code": row["code"]})
+    return {"status": "ok"}
+
+
+@app.post("/api/billing/redeem")
+async def redeem_code(
+    body: RedeemBody, user: dict[str, Any] = Depends(user_from_header)
+) -> dict[str, Any]:
+    if user.get("banned"):
+        raise HTTPException(403, "This account is suspended for repeated dangerous activity")
+    if not body.terms_accepted:
+        raise HTTPException(400, "Accept the acceptable-use policy before redeeming a code")
+    code = normalize_redeem_code(body.code)
+    if not code:
+        raise HTTPException(400, "Enter a redeem code")
+    with db() as conn:
+        row = conn.execute("SELECT * FROM redeem_codes WHERE code = ?", (code,)).fetchone()
+        redeem = row_to_dict(row)
+        if not redeem or not redeem.get("active"):
+            raise HTTPException(404, "This redeem code is not valid")
+        if redeem.get("expires_at") and (
+            _parse_utc(redeem["expires_at"]) or datetime.now(timezone.utc)
+        ) <= datetime.now(timezone.utc):
+            raise HTTPException(400, "This redeem code has expired")
+        if int(redeem.get("uses") or 0) >= int(redeem.get("max_uses") or 1):
+            raise HTTPException(400, "This redeem code has already been fully used")
+        if conn.execute(
+            "SELECT id FROM redeem_uses WHERE code_id = ? AND user_id = ?",
+            (redeem["id"], user["id"]),
+        ).fetchone():
+            raise HTTPException(400, "You have already redeemed this code")
+        plan = get_plan(conn, int(redeem["plan_id"]), active_only=False)
+        target = validate_target_server(conn, user, body.target_server_id)
+        if target is None:
+            assert_new_server_capacity(conn, user, plan)
+            order_egg(body.egg_id)
+        server_name = (body.server_name or "").strip()[:80]
+        if target is None and not server_name:
+            server_name = f"{plan['name']} deployment"
+        order_code = new_order_code(conn)
+        cur = conn.execute(
+            """INSERT INTO orders
+            (code, user_id, plan_id, payment_method_id, target_server_id, server_name,
+             egg_id, amount_cents, currency, status, reference, notes, terms_accepted,
+             created_at, updated_at)
+            VALUES (?, ?, ?, NULL, ?, ?, ?, 0, ?, 'pending', ?, ?, 1, ?, ?)""",
+            (
+                order_code,
+                user["id"],
+                plan["id"],
+                target["id"] if target else None,
+                server_name,
+                int(body.egg_id) if target is None and body.egg_id else None,
+                plan["currency"],
+                f"REDEEM {code}",
+                f"Redeemed with {code}"[:300],
+                utcnow(),
+                utcnow(),
+            ),
+        )
+        order_id = int(cur.lastrowid)
+        conn.execute(
+            """INSERT INTO redeem_uses (code_id, user_id, order_id, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (redeem["id"], user["id"], order_id, utcnow()),
+        )
+        conn.execute(
+            "UPDATE redeem_codes SET uses = uses + 1 WHERE id = ?", (redeem["id"],)
+        )
+        order = get_order(conn, order_id)
+    try:
+        server, mc_job = await fulfill_order(order, plan, int(user["id"]))
+    except HTTPException as exc:
+        with db() as conn:
+            conn.execute("DELETE FROM redeem_uses WHERE order_id = ?", (order_id,))
+            conn.execute(
+                "UPDATE redeem_codes SET uses = MAX(0, uses - 1) WHERE id = ?",
+                (redeem["id"],),
+            )
+            conn.execute("DELETE FROM orders WHERE id = ?", (order_id,))
+        raise HTTPException(
+            exc.status_code,
+            f"The code was not consumed. {exc.detail}",
+        ) from exc
+    except Exception as exc:
+        with db() as conn:
+            conn.execute("DELETE FROM redeem_uses WHERE order_id = ?", (order_id,))
+            conn.execute(
+                "UPDATE redeem_codes SET uses = MAX(0, uses - 1) WHERE id = ?",
+                (redeem["id"],),
+            )
+            conn.execute("DELETE FROM orders WHERE id = ?", (order_id,))
+        raise HTTPException(502, f"The plan could not be provisioned: {str(exc)[:300]}") from exc
+    with db() as conn:
+        conn.execute(
+            """UPDATE orders SET status = 'approved', server_id = ?, reviewed_at = ?,
+               updated_at = ? WHERE id = ?""",
+            (server.get("id"), utcnow(), utcnow(), order_id),
+        )
+        order = get_order(conn, order_id)
+    log_activity(
+        user["id"],
+        server.get("id"),
+        "redeem:use",
+        {"code": code, "plan": plan["slug"], "order": order["code"]},
+    )
+    return {
+        "data": order,
+        "server": decorate_server(server) if server else None,
+        "minecraft_job": mc_job,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Owner administration: rules, security and account recovery
+# ---------------------------------------------------------------------------
+
+
+def validate_rule_body(conn: Any, body: RuleBody) -> tuple:
+    scope = (body.scope or "global").strip()
+    if scope not in ("global", "nest", "egg", "server"):
+        raise HTTPException(400, "Rule scope must be global, nest, egg or server")
+    title = body.title.strip()[:160]
+    text = body.body.strip()[:4000]
+    if not title or not text:
+        raise HTTPException(400, "A rule needs a title and body")
+    severity = (body.severity or "info").strip()
+    if severity not in ("info", "warning", "critical"):
+        raise HTTPException(400, "Rule severity must be info, warning or critical")
+    server_id = (body.server_id or "").strip() or None
+    egg_id = int(body.egg_id) if body.egg_id else None
+    nest_id = int(body.nest_id) if body.nest_id else None
+    if scope == "server":
+        if not server_id or not conn.execute(
+            "SELECT id FROM servers WHERE id = ?", (server_id,)
+        ).fetchone():
+            raise HTTPException(400, "Choose an existing server for a server rule")
+        egg_id = None
+        nest_id = None
+    elif scope == "egg":
+        if not egg_id or not resolve_egg(egg_id):
+            raise HTTPException(400, "Choose an existing egg for an egg rule")
+        server_id = None
+    elif scope == "nest":
+        if not nest_id or not any(int(nest["id"]) == nest_id for nest in NESTS):
+            raise HTTPException(400, "Choose an existing nest for a nest rule")
+        server_id = None
+        egg_id = None
+    else:
+        server_id = None
+        egg_id = None
+        nest_id = None
+    return (
+        scope,
+        server_id,
+        egg_id,
+        nest_id,
+        title,
+        text,
+        body.category.strip()[:60] or "Operations",
+        severity,
+        int(body.sort_order),
+        1 if body.enabled else 0,
+    )
+
+
+@app.get("/api/admin/rules")
+def admin_rules(_: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
+    with db() as conn:
+        rows = rows_to_list(
+            conn.execute(
+                """SELECT r.*, s.name AS server_name, e.name AS egg_name, n.name AS nest_name
+                   FROM rules r
+                   LEFT JOIN servers s ON s.id = r.server_id
+                   LEFT JOIN eggs e ON e.id = r.egg_id
+                   LEFT JOIN nests n ON n.id = r.nest_id
+                   ORDER BY CASE r.scope WHEN 'global' THEN 0 WHEN 'nest' THEN 1
+                     WHEN 'egg' THEN 2 ELSE 3 END, r.sort_order, r.id"""
+            ).fetchall()
+        )
+    for row in rows:
+        row["enabled"] = bool(row.get("enabled"))
+    return {"data": rows}
+
+
+@app.post("/api/admin/rules")
+def admin_create_rule(
+    body: RuleBody, admin: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    with db() as conn:
+        values = validate_rule_body(conn, body)
+        cur = conn.execute(
+            """INSERT INTO rules
+            (scope, server_id, egg_id, nest_id, title, body, category, severity,
+             sort_order, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (*values, utcnow(), utcnow()),
+        )
+        rule = row_to_dict(
+            conn.execute("SELECT * FROM rules WHERE id = ?", (int(cur.lastrowid),)).fetchone()
+        ) or {}
+        rule["enabled"] = bool(rule.get("enabled"))
+    log_activity(admin["id"], rule.get("server_id"), "rule:create", {"rule": rule.get("title")})
+    return {"data": rule}
+
+
+@app.put("/api/admin/rules/{rule_id}")
+def admin_update_rule(
+    rule_id: int, body: RuleBody, admin: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM rules WHERE id = ?", (rule_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Rule not found")
+        values = validate_rule_body(conn, body)
+        conn.execute(
+            """UPDATE rules SET scope = ?, server_id = ?, egg_id = ?, nest_id = ?,
+               title = ?, body = ?, category = ?, severity = ?, sort_order = ?,
+               enabled = ?, updated_at = ? WHERE id = ?""",
+            (*values, utcnow(), rule_id),
+        )
+        rule = row_to_dict(
+            conn.execute("SELECT * FROM rules WHERE id = ?", (rule_id,)).fetchone()
+        ) or {}
+        rule["enabled"] = bool(rule.get("enabled"))
+    log_activity(admin["id"], rule.get("server_id"), "rule:update", {"rule": rule.get("title")})
+    return {"data": rule}
+
+
+@app.delete("/api/admin/rules/{rule_id}")
+def admin_delete_rule(
+    rule_id: int, admin: dict[str, Any] = Depends(admin_user)
+) -> dict[str, str]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM rules WHERE id = ?", (rule_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Rule not found")
+        conn.execute("DELETE FROM rules WHERE id = ?", (rule_id,))
+    log_activity(admin["id"], row["server_id"], "rule:delete", {"rule": row["title"]})
+    return {"status": "ok"}
+
+
+@app.get("/api/admin/security")
+def admin_security(_: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
+    with db() as conn:
+        settings = security_settings(conn)
+        strikes = rows_to_list(
+            conn.execute(
+                """SELECT st.*, u.username, s.name AS server_name
+                   FROM security_strikes st
+                   LEFT JOIN users u ON u.id = st.user_id
+                   LEFT JOIN servers s ON s.id = st.server_id
+                   ORDER BY st.id DESC LIMIT 150"""
+            ).fetchall()
+        )
+        banned = rows_to_list(
+            conn.execute(
+                """SELECT id, username, email, role, banned_at, ban_reason, created_at
+                   FROM users WHERE banned = 1 ORDER BY banned_at DESC"""
+            ).fetchall()
+        )
+        held = rows_to_list(
+            conn.execute(
+                """SELECT s.id, s.name, s.suspended_reason, s.owner_id, u.username AS owner_name
+                   FROM servers s LEFT JOIN users u ON u.id = s.owner_id
+                   WHERE s.suspended = 1 AND s.suspended_reason LIKE '%Security hold%'
+                   ORDER BY s.name COLLATE NOCASE"""
+            ).fetchall()
+        )
+        totals = row_to_dict(
+            conn.execute(
+                """SELECT COUNT(*) AS strikes,
+                          COUNT(DISTINCT user_id) AS accounts,
+                          COUNT(DISTINCT server_id) AS servers
+                   FROM security_strikes"""
+            ).fetchone()
+        ) or {}
+    for row in strikes:
+        row["strike"] = row.get("id")
+    return {
+        "settings": settings,
+        "strikes": [security_strike_payload(row) for row in strikes],
+        "banned": banned,
+        "held_servers": held,
+        "totals": totals,
+    }
+
+
+@app.put("/api/admin/security/settings")
+def admin_security_settings(
+    body: SecuritySettingsBody, admin: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    updates: dict[str, str] = {}
+    if body.detection is not None:
+        updates["security_detection"] = "true" if body.detection else "false"
+    if body.auto_suspend is not None:
+        updates["security_auto_suspend"] = "true" if body.auto_suspend else "false"
+    if body.ban_threshold is not None:
+        updates["security_ban_threshold"] = str(max(2, min(10, int(body.ban_threshold))))
+    with db() as conn:
+        for key, value in updates.items():
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+        settings = security_settings(conn)
+    log_activity(admin["id"], None, "security:settings", settings)
+    return {"settings": settings}
+
+
+@app.post("/api/admin/security/users/{user_id}/unban")
+def admin_unban_user(
+    user_id: int,
+    release_servers: bool = Query(True),
+    clear_strikes: bool = Query(False),
+    admin: dict[str, Any] = Depends(admin_user),
+) -> dict[str, Any]:
+    with db() as conn:
+        user = row_to_dict(conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone())
+        if not user:
+            raise HTTPException(404, "User not found")
+        conn.execute(
+            "UPDATE users SET banned = 0, banned_at = NULL, ban_reason = '' WHERE id = ?",
+            (user_id,),
+        )
+        if release_servers:
+            conn.execute(
+                """UPDATE servers SET suspended = 0, suspended_reason = ''
+                   WHERE owner_id = ? AND suspended_reason LIKE '%Security hold%'""",
+                (user_id,),
+            )
+            conn.execute(
+                """UPDATE servers SET suspended = 0, suspended_reason = ''
+                   WHERE owner_id = ? AND suspended_reason LIKE '%Account security hold%'""",
+                (user_id,),
+            )
+        if clear_strikes:
+            conn.execute("DELETE FROM security_strikes WHERE user_id = ?", (user_id,))
+        refreshed = row_to_dict(
+            conn.execute(
+                "SELECT id, username, email, role, banned, banned_at, ban_reason FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+        )
+    log_activity(
+        admin["id"],
+        None,
+        "security:unban",
+        {"user_id": user_id, "release_servers": release_servers, "clear_strikes": clear_strikes},
+    )
+    return {"data": refreshed}
+
+
+@app.post("/api/admin/security/servers/{server_id}/release")
+async def admin_release_server(
+    server_id: str, admin: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    with db() as conn:
+        server = row_to_dict(conn.execute("SELECT * FROM servers WHERE id = ?", (server_id,)).fetchone())
+        if not server:
+            raise HTTPException(404, "Server not found")
+        conn.execute(
+            "UPDATE servers SET suspended = 0, suspended_reason = '' WHERE id = ?", (server_id,)
+        )
+    log_activity(admin["id"], server_id, "security:release-server", {})
+    return {"status": "ok"}
+
+
+@app.get("/api/admin/security/users/{user_id}")
+def admin_security_user(
+    user_id: int, _: dict[str, Any] = Depends(admin_user)
+) -> dict[str, Any]:
+    with db() as conn:
+        user = row_to_dict(
+            conn.execute(
+                "SELECT id, username, email, role, banned, banned_at, ban_reason, created_at "
+                "FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+        )
+        if not user:
+            raise HTTPException(404, "User not found")
+        rows = conn.execute(
+            """SELECT st.*, s.name AS server_name FROM security_strikes st
+               LEFT JOIN servers s ON s.id = st.server_id
+               WHERE st.user_id = ? ORDER BY st.id DESC LIMIT 80""",
+            (user_id,),
+        ).fetchall()
+    return {
+        "user": user,
+        "strikes": [security_strike_payload(row) for row in rows],
+        "total": len(rows),
     }
 
 

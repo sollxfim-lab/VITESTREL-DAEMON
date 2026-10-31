@@ -35,7 +35,7 @@ def _http_py(egg: str) -> str:
         "    def do_GET(self):\n"
         "        if self.path.split('?', 1)[0] in ('/', '/health', '/status'):\n"
         "            self._send(200, {\n"
-        "                'panel': 'vitestl',\n"
+        "                'panel': 'meridian',\n"
         "                'egg': EGG,\n"
         "                'status': 'ok',\n"
         "                'port': PORT,\n"
@@ -66,7 +66,7 @@ def _node_http(egg: str) -> str:
         "  res.setHeader('Access-Control-Allow-Origin', '*');\n"
         "  if (url === '/' || url === '/health' || url === '/status') {\n"
         "    res.end(JSON.stringify({\n"
-        "      panel: 'vitestl',\n"
+        "      panel: 'meridian',\n"
         "      egg,\n"
         "      status: 'ok',\n"
         "      port,\n"
@@ -94,7 +94,7 @@ def _java_game(software: str) -> str:
         "        int port = 25565;\n"
         "        try { port = Integer.parseInt(System.getenv().getOrDefault(\"SERVER_PORT\", \"25565\")); }\n"
         "        catch (Exception ignored) {}\n"
-        "        String motd = System.getenv().getOrDefault(\"MOTD\", \"A VITESTERTL Minecraft Server\");\n"
+        "        String motd = System.getenv().getOrDefault(\"MOTD\", \"A Meridian Minecraft Server\");\n"
         f'        String software = System.getenv().getOrDefault("SOFTWARE", "{software}");\n'
         "        java.net.ServerSocket ss = new java.net.ServerSocket(port);\n"
         "        System.out.println(software + \" listening on 0.0.0.0:\" + port);\n"
@@ -103,7 +103,7 @@ def _java_game(software: str) -> str:
         "            java.net.Socket s = ss.accept();\n"
         "            java.io.OutputStream out = s.getOutputStream();\n"
         "            String safe = motd.replace(\"\\\\\", \" \").replace(\"\\\"\", \"'\");\n"
-        "            String json = \"{\\\"panel\\\":\\\"vitestl\\\",\\\"egg\\\":\\\"minecraft\\\",\\\"software\\\":\\\"\"\n"
+        "            String json = \"{\\\"panel\\\":\\\"meridian\\\",\\\"egg\\\":\\\"minecraft\\\",\\\"software\\\":\\\"\"\n"
         "                + software + \"\\\",\\\"motd\\\":\\\"\" + safe + \"\\\",\\\"port\\\":\" + port + \",\\\"online\\\":true}\";\n"
         "            byte[] body = json.getBytes();\n"
         "            String hdr = \"HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: \"\n"
@@ -141,7 +141,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/health"):
             self._send(200, {
-                "panel": "vitestl",
+                "panel": "meridian",
                 "egg": "python-generic",
                 "status": "ok",
                 "port": PORT,
@@ -163,12 +163,12 @@ from fastapi import FastAPI
 from datetime import datetime, timezone
 import os, platform, socket
 
-app = FastAPI(title=os.environ.get("SERVER_NAME", "vitestl-api"), version="1.0.0")
+app = FastAPI(title=os.environ.get("SERVER_NAME", "meridian-api"), version="1.0.0")
 
 @app.get("/")
 def root():
     return {
-        "service": os.environ.get("SERVER_NAME", "vitestl-api"),
+        "service": os.environ.get("SERVER_NAME", "meridian-api"),
         "runtime": "python-fastapi",
         "host": socket.gethostname(),
         "python": platform.python_version(),
@@ -210,7 +210,7 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path in ("/", "/health"):
             self._send(200, {
-                "panel": "vitestl",
+                "panel": "meridian",
                 "egg": "python-flask",
                 "framework": "flask-compat",
                 "status": "ok",
@@ -238,7 +238,7 @@ TICKS = {"n": 0}
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         body = json.dumps({
-            "panel": "vitestl",
+            "panel": "meridian",
             "egg": "python-worker",
             "status": "ok",
             "port": PORT,
@@ -278,7 +278,7 @@ const server = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   if (url === "/" || url === "/health") {
     res.end(JSON.stringify({
-      panel: "vitestl",
+      panel: "meridian",
       egg: "nodejs",
       status: "ok",
       port,
@@ -321,12 +321,12 @@ _STATIC_INDEX = '''\
 <body>
   <main>
     <h1>Lantern</h1>
-    <p>Static origin served by VITESTERTL. Replace this file from the file manager.</p>
+    <p>Static origin served by Meridian. Replace this file from the file manager.</p>
     <div class="grid">
       <div class="card"><div class="k">Status</div><div class="v ok">operational</div></div>
       <div class="card"><div class="k">Runtime</div><div class="v">python http.server</div></div>
       <div class="card"><div class="k">Region</div><div class="v">node-01</div></div>
-      <div class="card"><div class="k">Panel</div><div class="v">vitestl 2.0.0</div></div>
+      <div class="card"><div class="k">Panel</div><div class="v">meridian 2.0.0</div></div>
     </div>
   </main>
 </body>
@@ -341,7 +341,7 @@ public class Main {
         catch (Exception ignored) {}
         java.net.ServerSocket ss = new java.net.ServerSocket(port);
         System.out.println("java listening on 0.0.0.0:" + port);
-        byte[] body = "{\\"panel\\":\\"vitestl\\",\\"egg\\":\\"java\\"}".getBytes();
+        byte[] body = "{\\"panel\\":\\"meridian\\",\\"egg\\":\\"java\\"}".getBytes();
         while (true) {
             java.net.Socket s = ss.accept();
             java.io.OutputStream out = s.getOutputStream();
@@ -377,7 +377,7 @@ import os, json
 PORT = int(os.environ.get("SERVER_PORT", "8080"))
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
-        b = json.dumps({"panel":"vitestl","egg":"shell","port":PORT}).encode()
+        b = json.dumps({"panel":"meridian","egg":"shell","port":PORT}).encode()
         self.send_response(200)
         self.send_header("Content-Type","application/json")
         self.send_header("Content-Length", str(len(b)))
@@ -592,7 +592,7 @@ EGG = os.environ.get("EGG_NAME", "bot")
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
         body = json.dumps({
-            "panel": "vitestl",
+            "panel": "meridian",
             "egg": EGG,
             "status": "waiting" if not TOKEN else "configured",
             "token_set": bool(TOKEN),
@@ -632,7 +632,7 @@ func main() {
     http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
         w.Header().Set("Content-Type", "application/json")
         json.NewEncoder(w).Encode(map[string]any{
-            "panel": "vitestl",
+            "panel": "meridian",
             "egg":   "go",
             "status": "ok",
             "port":  port,
@@ -653,7 +653,7 @@ fn main() {
     let port = env::var("SERVER_PORT").unwrap_or_else(|_| "8080".into());
     let listener = TcpListener::bind(format!("0.0.0.0:{port}")).unwrap();
     println!("rust listening on 0.0.0.0:{port}");
-    let body = format!("{{\\"panel\\":\\"vitestl\\",\\"egg\\":\\"rust\\",\\"port\\":{port}}}");
+    let body = format!("{{\\"panel\\":\\"meridian\\",\\"egg\\":\\"rust\\",\\"port\\":{port}}}");
     for stream in listener.incoming() {
         if let Ok(mut s) = stream {
             let resp = format!(
@@ -671,7 +671,7 @@ _PHP_INDEX = '''\
 <?php
 header("Content-Type: application/json");
 echo json_encode([
-  "panel" => "vitestl",
+  "panel" => "meridian",
   "egg" => "php",
   "status" => "ok",
   "port" => getenv("SERVER_PORT") ?: "8080",
@@ -683,7 +683,7 @@ _DENO_MAIN = '''\
 const port = Number(Deno.env.get("SERVER_PORT") || 8080);
 Deno.serve({ port, hostname: "0.0.0.0" }, () => {
   return Response.json({
-    panel: "vitestl",
+    panel: "meridian",
     egg: "deno",
     status: "ok",
     port,
@@ -700,7 +700,7 @@ if command -v go >/dev/null 2>&1 && [ -f main.go ]; then
   exec go run main.go
 fi
 if command -v rustc >/dev/null 2>&1 && [ -f main.rs ]; then
-  rustc main.rs -o /tmp/vitestl-rust && exec /tmp/vitestl-rust
+  rustc main.rs -o /tmp/meridian-rust && exec /tmp/meridian-rust
 fi
 if command -v php >/dev/null 2>&1 && [ -f index.php ]; then
   exec php -S 0.0.0.0:"${PORT}"
@@ -713,7 +713,7 @@ exec python3 serve.py
 
 
 _MC_JAVA_README = """\
-VITESTERTL Minecraft Java
+Meridian Minecraft Java
 =========================
 
 This workload is provisioned by the Minecraft installer that ships with the
@@ -722,14 +722,14 @@ provisioning wizard or from the Minecraft tab of the server workspace.
 
 The installer downloads official artifacts only, preserves worlds, plugins and
 mods, writes server.properties with the allocated port and stores its manifest
-in .vitestl-minecraft.json.
+in .meridian-minecraft.json.
 
 Supported software: Vanilla, Paper, Purpur, Folia, Fabric, Quilt, Forge,
 NeoForge, Velocity, Waterfall and BungeeCord.
 """
 
 _MC_BEDROCK_README = """\
-VITESTERTL Minecraft Bedrock
+Meridian Minecraft Bedrock
 ============================
 
 The Bedrock Dedicated Server is installed from the official Minecraft services
@@ -788,7 +788,7 @@ EGGS = [
         "node:20-alpine", "node {{JS_FILE}}",
         {
             "index.js": _NODE_MAIN,
-            "package.json": '{\n  "name": "vitestl-node",\n  "version": "1.0.0",\n  "main": "index.js"\n}\n',
+            "package.json": '{\n  "name": "meridian-node",\n  "version": "1.0.0",\n  "main": "index.js"\n}\n',
         },
         [{"env": "JS_FILE", "name": "Startup file", "default": "index.js", "rules": "required|string"}],
     ),
@@ -841,7 +841,7 @@ EGGS = [
         "node:20-alpine", "node {{JS_FILE}}",
         {
             "index.js": _node_http("express"),
-            "package.json": '{\n  "name": "vitestl-express",\n  "version": "1.0.0",\n  "main": "index.js"\n}\n',
+            "package.json": '{\n  "name": "meridian-express",\n  "version": "1.0.0",\n  "main": "index.js"\n}\n',
         },
         [{"env": "JS_FILE", "name": "Startup file", "default": "index.js", "rules": "required|string"}],
     ),
@@ -872,7 +872,7 @@ EGGS = [
         "sh -c 'javac Server.java && java Server'",
         {"Server.java": _java_game("vanilla")},
         [
-            {"env": "MOTD", "name": "MOTD", "default": "A VITESTERTL Minecraft Server", "rules": "required|string"},
+            {"env": "MOTD", "name": "MOTD", "default": "A Meridian Minecraft Server", "rules": "required|string"},
             {"env": "SOFTWARE", "name": "Software", "default": "vanilla", "rules": "required|string"},
         ],
     ),
@@ -883,7 +883,7 @@ EGGS = [
         "sh -c 'javac Server.java && java Server'",
         {"Server.java": _java_game("paper")},
         [
-            {"env": "MOTD", "name": "MOTD", "default": "Paper on VITESTERTL", "rules": "required|string"},
+            {"env": "MOTD", "name": "MOTD", "default": "Paper on Meridian", "rules": "required|string"},
             {"env": "SOFTWARE", "name": "Software", "default": "paper", "rules": "required|string"},
         ],
     ),
@@ -892,7 +892,7 @@ EGGS = [
         "Bedrock-style status process. HTTP health on SERVER_PORT for the allocation proxy.",
         "python:3.11-slim", "python3 bedrock.py",
         {"bedrock.py": _http_py("bedrock")},
-        [{"env": "MOTD", "name": "MOTD", "default": "Bedrock on VITESTERTL", "rules": "string"}],
+        [{"env": "MOTD", "name": "MOTD", "default": "Bedrock on Meridian", "rules": "string"}],
     ),
     _egg(
         15, 7, "Mumble",
@@ -989,7 +989,7 @@ EGGS = [
             {"env": "MC_SOFTWARE", "name": "Minecraft software", "default": "paper", "rules": "string"},
             {"env": "MC_VERSION", "name": "Minecraft version", "default": "", "rules": "string"},
             {"env": "MC_LOADER", "name": "Loader or build", "default": "", "rules": "string"},
-            {"env": "MOTD", "name": "MOTD", "default": "A VITESTERTL Minecraft Server", "rules": "string"},
+            {"env": "MOTD", "name": "MOTD", "default": "A Meridian Minecraft Server", "rules": "string"},
         ],
     ),
     _egg(
@@ -1000,7 +1000,7 @@ EGGS = [
         {"README-FIRST.txt": _MC_BEDROCK_README},
         [
             {"env": "MC_VERSION", "name": "Bedrock version", "default": "", "rules": "string"},
-            {"env": "MOTD", "name": "Server name", "default": "VITESTERTL Bedrock", "rules": "string"},
+            {"env": "MOTD", "name": "Server name", "default": "Meridian Bedrock", "rules": "string"},
         ],
     ),
 ]
