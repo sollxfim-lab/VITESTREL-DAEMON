@@ -10,6 +10,183 @@ export type User = {
   root_admin?: boolean;
   two_factor_enabled?: boolean;
   servers?: number;
+  banned?: boolean;
+  banned_at?: string | null;
+  ban_reason?: string;
+};
+
+export type PlanArtifact = {
+  motif?: string;
+  serial?: string;
+  caption?: string;
+};
+
+export type Plan = {
+  id: number;
+  slug: string;
+  name: string;
+  tagline: string;
+  description: string;
+  price_cents: number;
+  currency: string;
+  billing_period: string;
+  memory: number;
+  cpu: number;
+  disk: number;
+  swap: number;
+  io: number;
+  server_slots: number;
+  database_limit: number;
+  backup_limit: number;
+  allocation_limit: number;
+  features: string[];
+  artifact: PlanArtifact;
+  accent: string;
+  badge: string;
+  sort_order?: number;
+  featured: boolean;
+  active: boolean;
+};
+
+export type PaymentMethod = {
+  id: number;
+  name: string;
+  kind: string;
+  account_name: string;
+  account_id: string;
+  qr_image: string;
+  instructions: string;
+  enabled: boolean;
+  configured?: boolean;
+  qr_configured?: boolean;
+  account_configured?: boolean;
+  sort_order?: number;
+};
+
+export type BillingOrder = {
+  id: number;
+  code: string;
+  user_id: number;
+  buyer: { username: string; email: string };
+  plan_id: number;
+  plan: Plan | null;
+  payment_method_id: number | null;
+  payment_method: PaymentMethod | null;
+  server_id: string | null;
+  target_server_id: string | null;
+  target_server_name: string;
+  provisioned_server_name: string;
+  server_name: string;
+  egg_id: number | null;
+  amount_cents: number;
+  currency: string;
+  status: "pending" | "approved" | "rejected" | "cancelled";
+  reference: string;
+  notes: string;
+  proof_data: string;
+  admin_note: string;
+  terms_accepted: boolean;
+  reviewed_by: number | null;
+  reviewed_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type BillingCatalog = {
+  plans: Plan[];
+  payment_methods: PaymentMethod[];
+  summary: {
+    pending_orders: number;
+    servers_owned: number;
+    current_plans: Array<{
+      id: string;
+      name: string;
+      plan_id: number;
+      plan_expires_at: string | null;
+      plan_name: string;
+      plan_slug: string;
+      plan_accent: string;
+      plan_state: "active" | "expired";
+    }>;
+    payment_ready: number;
+  };
+};
+
+export type WorkloadOption = {
+  id: number;
+  name: string;
+  nest_id: number;
+  nest_name: string;
+  description: string;
+  runtime: string;
+};
+
+export type Rule = {
+  id: number;
+  scope: "global" | "nest" | "egg" | "server";
+  server_id: string | null;
+  egg_id: number | null;
+  nest_id: number | null;
+  title: string;
+  body: string;
+  category: string;
+  severity: "info" | "warning" | "critical";
+  sort_order: number;
+  enabled: boolean;
+  scope_label?: string;
+  server_name?: string | null;
+  egg_name?: string | null;
+  nest_name?: string | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type SecuritySettings = {
+  detection: boolean;
+  auto_suspend: boolean;
+  ban_threshold: number;
+};
+
+export type SecurityStrike = {
+  id: number;
+  user_id: number;
+  server_id: string | null;
+  source: string;
+  pattern: string;
+  label: string;
+  category: string;
+  severity: string;
+  snippet: string;
+  action: string;
+  created_at: string;
+  username?: string | null;
+  server_name?: string | null;
+};
+
+export type ServerSecurity = {
+  settings: SecuritySettings;
+  strikes: number;
+  server_strikes: number;
+  recent: SecurityStrike[];
+  suspended: boolean;
+  reason: string;
+};
+
+export type RedeemCode = {
+  id: number;
+  code: string;
+  plan_id: number;
+  plan_name?: string;
+  plan_accent?: string;
+  plan_price?: number;
+  max_uses: number;
+  uses: number;
+  expires_at: string | null;
+  active: boolean;
+  expired?: boolean;
+  note: string;
+  created_by: number | null;
+  created_at: string;
 };
 
 export type Stats = {
@@ -60,6 +237,11 @@ export type Server = {
   mc_installed_at?: string | null;
   mc_eula?: number;
   terminal_sudo?: number;
+  plan?: Plan | null;
+  plan_state?: "active" | "expired" | "none";
+  plan_activated_at?: string | null;
+  plan_expires_at?: string | null;
+  feature_limits?: { databases: number; allocations: number; backups: number };
 };
 
 export type MinecraftSoftware = {
@@ -1039,6 +1221,124 @@ export const api = {
     req<{ status: string }>(`/api/servers/${id}/plugins/${encodeURIComponent(filename)}`, {
       method: "DELETE",
     }),
+  billingCatalog: () => req<BillingCatalog>("/api/billing/catalog"),
+  billingWorkloads: () => req<{ data: WorkloadOption[] }>("/api/billing/workloads"),
+  billingOrders: () => req<{ data: BillingOrder[] }>("/api/billing/orders"),
+  billingOrder: (id: number) => req<{ data: BillingOrder }>(`/api/billing/orders/${id}`),
+  createOrder: (body: any) =>
+    req<{ data: BillingOrder }>("/api/billing/orders", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateOrderProof: (id: number, body: any) =>
+    req<{ data: BillingOrder }>(`/api/billing/orders/${id}/proof`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  cancelOrder: (id: number) =>
+    req<{ data: BillingOrder }>(`/api/billing/orders/${id}/cancel`, { method: "POST" }),
+  redeemCode: (body: any) =>
+    req<{ data: BillingOrder; server: Server | null; minecraft_job?: any }>("/api/billing/redeem", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  serverRules: (id: string) => req<{ data: Rule[] }>(`/api/servers/${id}/rules`),
+  serverSecurity: (id: string) => req<ServerSecurity>(`/api/servers/${id}/security`),
+  adminPlans: () => req<{ data: Plan[] }>("/api/admin/plans"),
+  adminCreatePlan: (body: any) =>
+    req<{ data: Plan }>("/api/admin/plans", { method: "POST", body: JSON.stringify(body) }),
+  adminUpdatePlan: (id: number, body: any) =>
+    req<{ data: Plan }>(`/api/admin/plans/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  adminDisablePlan: (id: number) =>
+    req<{ data: Plan }>(`/api/admin/plans/${id}`, { method: "DELETE" }),
+  adminPaymentMethods: () => req<{ data: PaymentMethod[] }>("/api/admin/payment-methods"),
+  adminCreatePaymentMethod: (body: any) =>
+    req<{ data: PaymentMethod }>("/api/admin/payment-methods", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  adminUpdatePaymentMethod: (id: number, body: any) =>
+    req<{ data: PaymentMethod }>(`/api/admin/payment-methods/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  adminDisablePaymentMethod: (id: number) =>
+    req<{ data: PaymentMethod }>(`/api/admin/payment-methods/${id}`, { method: "DELETE" }),
+  adminOrders: (status = "") =>
+    req<{ data: BillingOrder[]; counts: Record<string, number> }>(
+      `/api/admin/orders${status ? `?status=${encodeURIComponent(status)}` : ""}`
+    ),
+  adminOrder: (id: number) => req<{ data: BillingOrder }>(`/api/admin/orders/${id}`),
+  adminApproveOrder: (id: number, reason = "") =>
+    req<{ data: BillingOrder; server: Server | null; minecraft_job?: any }>(
+      `/api/admin/orders/${id}/approve`,
+      { method: "POST", body: JSON.stringify({ reason }) }
+    ),
+  adminRejectOrder: (id: number, reason: string) =>
+    req<{ data: BillingOrder }>(`/api/admin/orders/${id}/reject`, {
+      method: "POST",
+      body: JSON.stringify({ reason }),
+    }),
+  adminRedeemCodes: () => req<{ data: RedeemCode[] }>("/api/admin/redeem-codes"),
+  adminCreateRedeemCode: (body: any) =>
+    req<{ data: RedeemCode }>("/api/admin/redeem-codes", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  adminUpdateRedeemCode: (id: number, body: any) =>
+    req<{ data: RedeemCode }>(`/api/admin/redeem-codes/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  adminDeleteRedeemCode: (id: number) =>
+    req<{ status: string }>(`/api/admin/redeem-codes/${id}`, { method: "DELETE" }),
+  adminRules: () => req<{ data: Rule[] }>("/api/admin/rules"),
+  adminCreateRule: (body: any) =>
+    req<{ data: Rule }>("/api/admin/rules", { method: "POST", body: JSON.stringify(body) }),
+  adminUpdateRule: (id: number, body: any) =>
+    req<{ data: Rule }>(`/api/admin/rules/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  adminDeleteRule: (id: number) =>
+    req<{ status: string }>(`/api/admin/rules/${id}`, { method: "DELETE" }),
+  adminSecurity: () =>
+    req<{
+      settings: SecuritySettings;
+      strikes: SecurityStrike[];
+      banned: Array<{
+        id: number;
+        username: string;
+        email: string;
+        role: string;
+        banned_at: string | null;
+        ban_reason: string;
+        created_at: string;
+      }>;
+      held_servers: Array<{
+        id: string;
+        name: string;
+        suspended_reason: string;
+        owner_id: number;
+        owner_name: string;
+      }>;
+      totals: { strikes: number; accounts: number; servers: number };
+    }>("/api/admin/security"),
+  adminSaveSecurity: (body: any) =>
+    req<{ settings: SecuritySettings }>("/api/admin/security/settings", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  adminUnbanUser: (id: number, options?: { release_servers?: boolean; clear_strikes?: boolean }) => {
+    const params = new URLSearchParams();
+    params.set("release_servers", String(options?.release_servers ?? true));
+    params.set("clear_strikes", String(options?.clear_strikes ?? false));
+    return req<{ data: User }>(`/api/admin/security/users/${id}/unban?${params}`, {
+      method: "POST",
+    });
+  },
+  adminReleaseServer: (id: string) =>
+    req<{ status: string }>(`/api/admin/security/servers/${id}/release`, { method: "POST" }),
 };
 
 export function fmtBytes(n: number): string {

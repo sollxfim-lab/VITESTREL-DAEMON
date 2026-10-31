@@ -16,7 +16,7 @@ export function IconMark({ className = "" }: { className?: string }) {
   return (
     <svg className={className} viewBox="0 0 32 32" fill="none" aria-hidden="true">
       <path
-        d="M5.2 6.5h5.1L16 23.3 21.7 6.5h5.1L18.7 28h-5.4L5.2 6.5Z"
+        d="M6 26V6h4.4L16 17.2 21.6 6H26v20h-4.3V13.6L16.9 24h-1.8L10.3 13.6V26H6Z"
         fill="currentColor"
       />
     </svg>

@@ -25,6 +25,9 @@ import Admin, {
 } from "./pages/Admin";
 import Account from "./pages/Account";
 import AiProviders from "./pages/AiProviders";
+import Billing from "./pages/Billing";
+import AdminCommerce from "./pages/AdminCommerce";
+import AdminSafety from "./pages/AdminSafety";
 import { Toaster } from "./ui";
 
 export default function App() {
@@ -61,7 +64,7 @@ export default function App() {
           <BrandMark />
         </div>
         <div className="boot-copy">
-          <strong>VITESTERTL</strong>
+          <strong>Meridian</strong>
           <span>Preparing your control plane</span>
         </div>
         <div className="boot-progress">
@@ -87,9 +90,12 @@ export default function App() {
         >
           <Route index element={<Dashboard />} />
           <Route path="server/:id" element={<ServerPage />} />
+          <Route path="billing" element={<Billing />} />
           <Route path="account" element={<Account />} />
           <Route path="admin" element={user?.role === "admin" ? <Admin /> : <Navigate to="/" replace />}>
             <Route index element={<AdminOverview />} />
+            <Route path="commerce" element={<AdminCommerce />} />
+            <Route path="safety" element={<AdminSafety />} />
             <Route path="servers" element={<AdminServers />} />
             <Route path="servers/new" element={<NewServer />} />
             <Route path="nodes" element={<Nodes />} />

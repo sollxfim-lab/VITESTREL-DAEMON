@@ -917,7 +917,7 @@ function NodeAutoInstall({
       const existing = data.existing_node;
       setAudit(data);
       setForm({
-        name: existing?.name || data.recommended.name || "vitestl-local",
+        name: existing?.name || data.recommended.name || "meridian-local",
         location_id: existing?.location_id || data.recommended.location_id || 1,
         memory: existing?.memory || data.recommended.memory || 8192,
         disk: existing?.disk || data.recommended.disk || 51200,
@@ -1030,7 +1030,7 @@ function NodeAutoInstall({
           </span>
           <h3>One host, one click, a complete local node.</h3>
           <p>
-            VITESTERTL runs workloads on this host. The installer verifies Python,
+            Meridian runs workloads on this host. The installer verifies Python,
             systemd, storage and the container runtime, then registers the node, reserves a
             contiguous port block and writes <code>&lt;data&gt;/nodes/node-&lt;id&gt;/node.json</code>.
           </p>
@@ -1085,7 +1085,7 @@ function NodeAutoInstall({
                 value={form.name}
                 onChange={(event) => setForm({ ...form, name: event.target.value })}
                 maxLength={64}
-                placeholder="vitestl-local"
+                placeholder="meridian-local"
               />
             </div>
             <div className="field">
@@ -3182,7 +3182,8 @@ export function DatabaseHosts() {
 
 function healthTone(status: string): string {
   if (["ok", "active", "enabled", "running"].includes(status)) return "ok";
-  if (["warn", "inactive", "unknown", "unavailable"].includes(status)) return "warn";
+  if (["warn", "inactive", "unknown"].includes(status)) return "warn";
+  if (status === "unavailable") return "neutral";
   return "danger";
 }
 
@@ -3215,7 +3216,16 @@ export function SystemHealth() {
   if (!data) return <LoadingPage label="Reading host telemetry" />;
 
   const securityOk = data.security.checks.filter((check: any) => check.status === "ok").length;
-  const securityWarn = data.security.checks.length - securityOk;
+  const securityAttention = data.security.checks.filter((check: any) => ["warn", "danger"].includes(check.status)).length;
+  const securityUnavailable = data.security.checks.filter((check: any) => check.status === "unavailable").length;
+  const securitySummary = [
+    `${securityOk} ok`,
+    securityAttention ? `${securityAttention} attention` : "",
+    securityUnavailable ? `${securityUnavailable} unavailable` : "",
+  ].filter(Boolean).join(" / ");
+  const securityPillTone = securityAttention ? "pill-warn" : securityUnavailable ? "pill-neutral" : "pill-ok";
+  const linuxHost = data.host.system === "Linux";
+  const loadAvailable = data.cpu.load_available !== false && Array.isArray(data.cpu.load);
 
   return (
     <div className="page system-page">
@@ -3243,7 +3253,7 @@ export function SystemHealth() {
             <strong>Host health is tuned for Debian and Ubuntu Linux</strong>
             <span>
               This panel is running on {data.host.system}. Linux-only checks such as systemd,
-              AppArmor and SSH policy are shown as unavailable rather than failing.
+              AppArmor and SSH policy are marked unavailable and excluded from the attention count.
             </span>
           </div>
         </div>
@@ -3273,7 +3283,11 @@ export function SystemHealth() {
         </article>
         <article className="card system-kpi">
           <span className="system-kpi-icon tone-uptime"><Icon name="gauge-high" /></span>
-          <div><span>Load average</span><strong>{data.cpu.load.map((value: number) => value.toFixed(2)).join(" / ")}</strong><small>1, 5 and 15 minute averages</small></div>
+          <div>
+            <span>Load average</span>
+            <strong>{loadAvailable ? data.cpu.load.map((value: number) => value.toFixed(2)).join(" / ") : "Unavailable"}</strong>
+            <small>{loadAvailable ? "1, 5 and 15 minute averages" : `Not reported on ${data.host.system}`}</small>
+          </div>
         </article>
       </section>
 
@@ -3319,21 +3333,21 @@ export function SystemHealth() {
         </section>
 
         <section className="card">
-          <div className="card-head"><div><h2>Security posture</h2><p>Debian and Ubuntu host hardening checks.</p></div><span className={`pill ${securityWarn ? "pill-warn" : "pill-ok"}`}>{securityOk} ok / {securityWarn} attention</span></div>
+          <div className="card-head"><div><h2>Security posture</h2><p>{linuxHost ? "Debian and Ubuntu host hardening checks." : `Linux hardening checks are not evaluated on ${data.host.system}.`}</p></div><span className={`pill ${securityPillTone}`}>{securitySummary}</span></div>
           <div className="card-body">
             <div className="health-list">
               {data.security.checks.map((check: any) => (
                 <div className="health-item" key={check.id}>
-                  <span className={`health-dot ${healthTone(check.status)}`}><Icon name={check.status === "ok" ? "check" : "circle-exclamation"} /></span>
+                  <span className={`health-dot ${healthTone(check.status)}`}><Icon name={check.status === "ok" ? "check" : check.status === "unavailable" ? "minus" : "circle-exclamation"} /></span>
                   <div><strong>{check.label}</strong><span>{check.detail}</span></div>
                 </div>
               ))}
             </div>
             <div className="identity-list">
-              <div><span>SSH password authentication</span><code>{data.security.ssh.password_authentication}</code></div>
-              <div><span>SSH root login</span><code>{data.security.ssh.permit_root_login}</code></div>
-              <div><span>SSH public key authentication</span><code>{data.security.ssh.pubkey_authentication}</code></div>
-              <div><span>Firewall</span><code>{data.security.firewall.manager} / {data.security.firewall.status}</code></div>
+              <div><span>SSH password authentication</span><code>{linuxHost ? data.security.ssh.password_authentication : "Unavailable"}</code></div>
+              <div><span>SSH root login</span><code>{linuxHost ? data.security.ssh.permit_root_login : "Unavailable"}</code></div>
+              <div><span>SSH public key authentication</span><code>{linuxHost ? data.security.ssh.pubkey_authentication : "Unavailable"}</code></div>
+              <div><span>Firewall</span><code>{linuxHost ? `${data.security.firewall.manager} / ${data.security.firewall.status}` : "Unavailable"}</code></div>
             </div>
           </div>
         </section>
@@ -3469,7 +3483,7 @@ export function PanelSettings() {
         <form className="card" onSubmit={save}>
           <div className="card-head"><div><h2>Branding</h2><p>Text shown on the sign-in screen and account footer.</p></div><span className="card-head-icon"><Icon name="pen-ruler" /></span></div>
           <div className="card-body">
-            <div className="field"><label>Organisation name</label><input value={form.company} onChange={(event) => setForm({ ...form, company: event.target.value })} placeholder="VITESTERTL" /><span className="field-help">Displayed as the operator name on the authentication screen.</span></div>
+            <div className="field"><label>Organisation name</label><input value={form.company} onChange={(event) => setForm({ ...form, company: event.target.value })} placeholder="Meridian Host" /><span className="field-help">Displayed as the operator name on the authentication screen.</span></div>
             <div className="field"><label>Support email</label><input type="email" value={form.support_email} onChange={(event) => setForm({ ...form, support_email: event.target.value })} placeholder="support@example.com" /><span className="field-help">Optional contact address shown to signed-out users.</span></div>
             <button className="btn btn-primary" disabled={busy}><Icon name={busy ? "circle-notch" : "floppy-disk"} className={busy ? "spin" : ""} /> Save branding</button>
           </div>

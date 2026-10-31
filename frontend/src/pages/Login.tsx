@@ -21,7 +21,7 @@ const capabilities = [
   },
 ];
 
-const REPO_URL = "https://github.com/sollxfim-lab/VITESTREL-DAEMON";
+const REPO_URL = "https://github.com/sollxfim-lab";
 
 export default function Login() {
   const [meta, setMeta] = useState<Meta | null>(null);
@@ -35,7 +35,7 @@ export default function Login() {
   const [code, setCode] = useState("");
 
   useEffect(() => {
-    document.title = "Sign in · VITESTERTL";
+    document.title = "Sign in · Meridian";
     api.meta().then(setMeta).catch(() => undefined);
   }, []);
 
@@ -90,7 +90,7 @@ export default function Login() {
           <div className="auth-brand">
             <BrandMark />
             <div>
-              <strong>{meta?.name || "VITESTERTL"}</strong>
+              <strong>{meta?.name || "Meridian"}</strong>
               <span>Infrastructure control plane</span>
             </div>
             <span className="auth-version">v{meta?.version || "2.1.0"}</span>
@@ -168,7 +168,7 @@ export default function Login() {
             <span>
               <Icon name="server" /> Debian-first runtime
             </span>
-            <span>{meta?.company || "VITESTERTL"}</span>
+            <span>{meta?.company || "Meridian Host"}</span>
           </footer>
         </div>
       </section>
@@ -178,7 +178,7 @@ export default function Login() {
           <div className="auth-emblem">
             <AuthEmblem />
             <div className="auth-emblem-copy">
-              <strong>{meta?.name || "VITESTERTL"}</strong>
+              <strong>{meta?.name || "Meridian"}</strong>
               <span>Game and application control plane</span>
             </div>
           </div>
@@ -305,7 +305,7 @@ export default function Login() {
           </div>
 
           <div className="auth-card-foot">
-            <span>{meta?.company || "VITESTERTL"}</span>
+            <span>{meta?.company || "Meridian Host"}</span>
             <span className="dot-separator" />
             <span>Panel {meta?.version || "2.1.0"}</span>
             {meta?.support_email && (
@@ -335,7 +335,7 @@ export default function Login() {
               href={REPO_URL}
               target="_blank"
               rel="noreferrer noopener"
-              aria-label="Open the VITESTREL GitHub repository in a new tab"
+              aria-label="Open the project GitHub organisation in a new tab"
             >
               <Icon name="github" brand />
               <span>GitHub</span>
@@ -343,7 +343,7 @@ export default function Login() {
             </a>
           </div>
           <p className="auth-thanks">
-            Thank you for using <strong>{meta?.name || "VITESTERTL"}</strong>.
+            Thank you for using <strong>{meta?.name || "Meridian"}</strong>.
           </p>
         </div>
         <p className="auth-panel-note">

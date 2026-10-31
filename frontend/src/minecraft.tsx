@@ -77,7 +77,7 @@ function propertyFields(software: MinecraftSoftware | null): PropertyField[] {
       key: bedrock ? "server-name" : "motd",
       label: bedrock ? "Server name" : "MOTD",
       kind: "text",
-      placeholder: bedrock ? "VITESTERTL Bedrock" : `${software.name} on VITESTERTL`,
+      placeholder: bedrock ? "Meridian Bedrock" : `${software.name} on Meridian`,
     },
     {
       key: "max-players",

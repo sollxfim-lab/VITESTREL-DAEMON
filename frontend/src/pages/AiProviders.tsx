@@ -523,7 +523,7 @@ export default function AiProviders() {
                   value={form.headers}
                   onChange={(event) => setForm({ ...form, headers: event.target.value })}
                   spellCheck={false}
-                  placeholder='{"X-Title": "VITESTERTL"}'
+                  placeholder='{"X-Title": "Meridian"}'
                 />
                 <span className="field-help">
                   JSON object merged into every request. Use for gateways that need routing or

@@ -1,4 +1,5 @@
 import {
+  CSSProperties,
   FormEvent,
   KeyboardEvent,
   createContext,
@@ -16,9 +17,11 @@ import {
   Activity,
   DatabaseHostOption,
   PermissionGroup,
+  Rule,
   Schedule,
   Server as Srv,
   ServerDatabase as ServerDatabaseRow,
+  ServerSecurity,
   Stats,
   TerminalInfo,
   User,
@@ -40,6 +43,7 @@ import {
   ConfirmButton,
   CopyButton,
   EmptyState,
+  ErrorPanel,
   LoadingPage,
   Modal,
   PageHeader,
@@ -59,6 +63,7 @@ const TABS = [
   { id: "network", label: "Network", icon: "network-wired" },
   { id: "startup", label: "Startup", icon: "rocket" },
   { id: "settings", label: "Settings", icon: "sliders" },
+  { id: "rules", label: "Rules", icon: "book" },
   { id: "activity", label: "Activity", icon: "clock-rotate-left" },
 ];
 
@@ -290,6 +295,30 @@ export default function ServerPage() {
       )}
       {error && <div className="banner banner-error"><Icon name="circle-exclamation" /><span>{error}</span></div>}
 
+      {server.plan && (
+        <div
+          className={`server-plan-chip plan-${server.plan.slug}`}
+          style={{ "--plan-accent": server.plan.accent || "#43b8f5" } as CSSProperties}
+        >
+          <span className="server-plan-icon"><Icon name="layer-group" /></span>
+          <div className="server-plan-copy">
+            <strong>{server.plan.name}</strong>
+            <span>
+              {server.plan.memory >= 1024 ? `${server.plan.memory / 1024} GB` : `${server.plan.memory} MB`} memory
+              {" · "}{server.plan.cpu}% CPU
+              {" · "}{server.plan.disk >= 1024 ? `${Math.round(server.plan.disk / 1024)} GB` : `${server.plan.disk} MB`} disk
+              {server.plan_state === "expired" ? " · renewal due" : ""}
+            </span>
+          </div>
+          <span className={`pill ${server.plan_state === "expired" ? "pill-warning" : "pill-ok"}`}>
+            {server.plan_state === "expired" ? "Renewal due" : "Plan active"}
+          </span>
+          <Link className="btn btn-ghost btn-sm" to="/billing">
+            <Icon name="arrows-rotate" /> Change plan
+          </Link>
+        </div>
+      )}
+
       <section className="resource-strip">
         <ResourceMini
           icon="microchip"
@@ -382,6 +411,7 @@ export default function ServerPage() {
             onDeleted={() => nav("/admin/servers")}
           />
         )}
+        {activeTab === "rules" && <RulesPane id={id} server={server} />}
         {activeTab === "activity" && <ActivityPane id={id} />}
       </ServerAccessContext.Provider>
     </div>
@@ -464,19 +494,23 @@ function ConsolePane({ id, server, stats, online }: { id: string; server: Srv; s
     socketRef.current = socket;
     socket.onopen = () => {
       setState("connected");
-      terminal.writeln("\x1b[38;5;245m[vitestl] Console stream attached.\x1b[0m");
+      terminal.writeln("\x1b[38;5;245m[meridian] Console stream attached.\x1b[0m");
     };
     socket.onclose = () => {
       setState("disconnected");
-      terminal.writeln("\x1b[38;5;245m[vitestl] Console stream closed.\x1b[0m");
+      terminal.writeln("\x1b[38;5;245m[meridian] Console stream closed.\x1b[0m");
     };
     socket.onmessage = (event) => {
       try {
         const message = JSON.parse(event.data);
         if (message.event === "console output") terminal.write(message.args[0]);
-        else if (message.event === "error") {
+        else if (message.event === "security warning") {
+          terminal.writeln(
+            `\x1b[31m[meridian] ${message.message || "Security policy blocked this command."}\x1b[0m`
+          );
+        } else if (message.event === "error") {
           setState("error");
-          terminal.writeln(`\x1b[31m[vitestl] ${message.message}\x1b[0m`);
+          terminal.writeln(`\x1b[31m[meridian] ${message.message}\x1b[0m`);
         }
       } catch {
         terminal.write(event.data);
@@ -981,12 +1015,12 @@ function TerminalPane({
       setState("disconnected");
       session.running = false;
       setRunning(false);
-      terminal.write("\r\n\x1b[38;5;244m[vitestl] Terminal stream closed.\x1b[0m\r\n");
+      terminal.write("\r\n\x1b[38;5;244m[meridian] Terminal stream closed.\x1b[0m\r\n");
     };
     socket.onerror = () => {
       if (disposed) return;
       setState("error");
-      terminal.write("\r\n\x1b[31m[vitestl] Terminal connection failed.\x1b[0m\r\n");
+      terminal.write("\r\n\x1b[31m[meridian] Terminal connection failed.\x1b[0m\r\n");
     };
     socket.onmessage = (event) => {
       if (disposed) return;
@@ -1005,7 +1039,7 @@ function TerminalPane({
         session.cwd = ready.cwd || "/";
         setCwd(session.cwd);
         setState("connected");
-        terminal.writeln("\x1b[38;5;179mVITESTERTL shell workspace\x1b[0m");
+        terminal.writeln("\x1b[38;5;179mMeridian shell workspace\x1b[0m");
         terminal.writeln(
           "\x1b[38;5;242mCommands run as the panel service account inside the server directory.\x1b[0m"
         );
@@ -1020,6 +1054,17 @@ function TerminalPane({
       }
       if (message.event === "terminal output") {
         writeOutput(String(message.data || ""));
+        return;
+      }
+      if (message.event === "security warning") {
+        terminal.write(
+          `\r\n\x1b[31m[meridian] ${message.message || "Security policy blocked this command."}\x1b[0m\r\n`
+        );
+        if (message.banned) {
+          notify("Repeated dangerous activity banned this account. Contact the panel owner.", "error");
+        } else if (message.suspended) {
+          notify("Security policy suspended this server pending owner review.", "error");
+        }
         return;
       }
       if (message.event === "terminal exit") {
@@ -1049,13 +1094,13 @@ function TerminalPane({
         return;
       }
       if (message.event === "terminal error") {
-        terminal.write(`\r\n\x1b[31m[vitestl] ${message.message}\x1b[0m\r\n`);
+        terminal.write(`\r\n\x1b[31m[meridian] ${message.message}\x1b[0m\r\n`);
         if (!session.running) writePrompt();
         return;
       }
       if (message.event === "error") {
         setState("error");
-        terminal.write(`\r\n\x1b[31m[vitestl] ${message.message}\x1b[0m\r\n`);
+        terminal.write(`\r\n\x1b[31m[meridian] ${message.message}\x1b[0m\r\n`);
       }
     };
 
@@ -3391,6 +3436,118 @@ function SettingsPane({
           </div>
         )}
       </Modal>
+    </div>
+  );
+}
+
+function RulesPane({ id, server }: { id: string; server: Srv }) {
+  const [rules, setRules] = useState<Rule[]>([]);
+  const [security, setSecurity] = useState<ServerSecurity | null>(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    Promise.all([api.serverRules(id), api.serverSecurity(id)])
+      .then(([ruleResponse, securityResponse]) => {
+        setRules(ruleResponse.data);
+        setSecurity(securityResponse);
+        setError("");
+      })
+      .catch((err: any) => setError(err.message || "Unable to load server policy"))
+      .finally(() => setLoading(false));
+  }, [id]);
+
+  if (loading) return <LoadingPage label="Loading server policy" />;
+  if (error) return <ErrorPanel message={error} retry={() => window.location.reload()} />;
+
+  const plan = server.plan;
+  const grouped: Array<{ key: string; label: string; icon: string; items: Rule[] }> = [
+    { key: "server", label: "This server", icon: "server", items: rules.filter((rule) => rule.scope === "server") },
+    { key: "egg", label: "Template policy", icon: "egg", items: rules.filter((rule) => rule.scope === "egg") },
+    { key: "nest", label: "Server type policy", icon: "layer-group", items: rules.filter((rule) => rule.scope === "nest") },
+    { key: "global", label: "Panel-wide policy", icon: "globe", items: rules.filter((rule) => rule.scope === "global") },
+  ].filter((group) => group.items.length > 0);
+
+  return (
+    <div className="rules-pane">
+      <section className="rules-policy-head">
+        <div className="rules-policy-plan">
+          <span className="eyebrow">Plan coverage</span>
+          <h2>{plan ? plan.name : "No paid plan applied"}</h2>
+          <p>
+            {plan
+              ? `${plan.tagline} Limits are enforced on this server until the plan changes or expires.`
+              : "This server runs on administrator-defined limits. Choose a plan to add guaranteed capacity and priority support."}
+          </p>
+          <div className="rules-policy-actions">
+            <Link className="btn btn-primary btn-sm" to="/billing">
+              <Icon name="layer-group" /> {plan ? "Change plan" : "Browse plans"}
+            </Link>
+            {server.plan_expires_at && (
+              <span className="section-meta">Renews {fmtDate(server.plan_expires_at)}</span>
+            )}
+          </div>
+        </div>
+        <div className={`rules-policy-security ${security?.suspended ? "is-held" : ""}`}>
+          <div className="rules-security-head">
+            <span className="rules-security-icon"><Icon name="shield-halved" /></span>
+            <div>
+              <span className="eyebrow">Security posture</span>
+              <strong>{security?.suspended ? "Server on security hold" : "Detection active"}</strong>
+            </div>
+          </div>
+          <p>
+            {security?.suspended
+              ? security.reason || "A critical finding suspended this server pending owner review."
+              : `Console commands, file saves and schedules are inspected. ${security?.strikes || 0} strike${
+                  (security?.strikes || 0) === 1 ? "" : "s"
+                } on this account; ${security?.settings.ban_threshold || 4} triggers an automatic ban.`}
+          </p>
+          {security && security.recent.length > 0 && (
+            <div className="rules-security-events">
+              {security.recent.slice(0, 3).map((event) => (
+                <span key={event.id} className={`severity-${event.severity}`}>
+                  <Icon name="triangle-exclamation" /> {event.label}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      </section>
+
+      {grouped.length === 0 && (
+        <div className="card">
+          <EmptyState
+            icon="book"
+            title="No rules published"
+            description="The owner has not published an acceptable-use rule for this server yet."
+          />
+        </div>
+      )}
+
+      {grouped.map((group) => (
+        <section className="rules-group" key={group.key}>
+          <div className="rules-group-head">
+            <span className="rules-group-icon"><Icon name={group.icon} /></span>
+            <div>
+              <h2>{group.label}</h2>
+              <span>{plural(group.items.length, "rule")}</span>
+            </div>
+          </div>
+          <div className="rules-grid">
+            {group.items.map((rule) => (
+              <article className={`rule-card severity-${rule.severity}`} key={rule.id}>
+                <div className="rule-card-head">
+                  <span className={`pill severity-pill severity-${rule.severity}`}>{rule.severity}</span>
+                  <span className="rule-category">{rule.category}</span>
+                </div>
+                <h3>{rule.title}</h3>
+                <p>{rule.body}</p>
+              </article>
+            ))}
+          </div>
+        </section>
+      ))}
     </div>
   );
 }

@@ -15,11 +15,14 @@ type SystemInfo = {
 const NAV = {
   workspace: [
     { to: "/", label: "Overview", icon: "gauge-high", end: true },
+    { to: "/billing", label: "Plans & billing", icon: "layer-group" },
     { to: "/account", label: "Account", icon: "user-gear" },
   ],
   admin: [
     { to: "/admin", label: "Administration", icon: "chart-pie", end: true },
     { to: "/admin/servers", label: "Servers", icon: "server" },
+    { to: "/admin/commerce", label: "Commerce", icon: "receipt" },
+    { to: "/admin/safety", label: "Safety", icon: "shield-halved" },
     { to: "/admin/nodes", label: "Nodes", icon: "network-wired" },
     { to: "/admin/locations", label: "Locations", icon: "location-dot" },
     { to: "/admin/nests", label: "Nests & eggs", icon: "layer-group" },
@@ -35,8 +38,11 @@ const NAV = {
 function pageLabel(pathname: string): string {
   const map: Record<string, string> = {
     "/": "Overview",
+    "/billing": "Plans & billing",
     "/account": "Account",
     "/admin": "Administration",
+    "/admin/commerce": "Commerce",
+    "/admin/safety": "Safety",
     "/admin/servers": "Servers",
     "/admin/servers/new": "Provision server",
     "/admin/nodes": "Nodes",
@@ -115,10 +121,10 @@ export default function Shell({
         aria-hidden="true"
       />
       <aside className={`sidebar ${menuOpen ? "open" : ""}`}>
-        <Link to="/" className="side-brand" aria-label="VITESTERTL overview">
+        <Link to="/" className="side-brand" aria-label="Meridian overview">
           <BrandMark />
           <span className="word">
-            VITESTERTL
+            Meridian
             <small>Control plane</small>
           </span>
           <span className="brand-version">v{system?.version || "1.7"}</span>
@@ -175,7 +181,7 @@ export default function Shell({
             </button>
             <div className="crumbs">
               <Link to="/" className="crumb-root">
-                <Icon name="house" /> VITESTERTL
+                <Icon name="house" /> Meridian
               </Link>
               <span className="sep">/</span>
               <strong>{pageLabel(loc.pathname)}</strong>

@@ -209,6 +209,9 @@ export default function Dashboard() {
         }
         actions={
           <>
+            <Link className="btn btn-ghost" to="/billing">
+              <Icon name="layer-group" /> Plans &amp; billing
+            </Link>
             {admin && (
               <Link className="btn" to="/admin/users/new">
                 <Icon name="user-plus" /> Create user
@@ -514,6 +517,17 @@ function ServerCard({
               {server.nest_name} / {server.egg_name}
               <span className="dot-separator" />
               {server.owner_name}
+              {server.plan && (
+                <>
+                  <span className="dot-separator" />
+                  <span
+                    className="server-plan-tag"
+                    style={{ "--plan-accent": server.plan.accent || "#43b8f5" } as CSSProperties}
+                  >
+                    {server.plan.name}
+                  </span>
+                </>
+              )}
             </span>
           </div>
         </div>
